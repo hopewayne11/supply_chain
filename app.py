@@ -961,8 +961,7 @@ with st.sidebar:
             "Marketing AI",
             "Fraud Detection",
             "Vision AI",
-            "Blockchain",
-            "Financial AI",
+            
             "Inbox & Products",
             "VENUS AI Assistant",
         ], label_visibility="collapsed")
@@ -1708,11 +1707,21 @@ if "Dashboard" in menu:
             st.markdown('</div>', unsafe_allow_html=True)
 
 # =========================================================
-# INVENTORY — List product, upload image, add description,
-#             edit existing products, all in one screen
+# INVENTORY — List products, upload photos, and run full
+#             Vision AI photo-intelligence, all in one screen.
+#             (Replaces the separate "Inventory" + "Vision AI"
+#              sections — delete the old "Vision AI" elif block
+#              and its sidebar/menu entry once this is in place.)
 # =========================================================
 elif "Inventory" in menu:
     import base64 as _b64
+    import io as _io
+    import json as _json
+    import hashlib as _hashlib
+    import numpy as np
+    import requests as _req
+    from PIL import Image
+    from scipy import ndimage
 
     st.markdown("""
     <style>
@@ -1740,6 +1749,9 @@ elif "Inventory" in menu:
     .inv-table tbody td.stock-ok   { color: #00e096; }
     .inv-table tbody td.has-img    { color: #00e096; font-size: 11px; }
     .inv-table tbody td.no-img     { color: #2a3a52; font-size: 11px; }
+    .inv-table tbody td.auth-high  { color: #00e096; font-weight: 600; }
+    .inv-table tbody td.auth-mid   { color: #ffb020; font-weight: 600; }
+    .inv-table tbody td.auth-low   { color: #ff4b6e; font-weight: 600; }
 
     /* ── Panels ── */
     .inv-panel {
@@ -1799,13 +1811,55 @@ elif "Inventory" in menu:
         border-color: rgba(0,229,255,0.3); color: #00e5ff;
     }
 
-    /* ── Quality badge ── */
-    .inv-quality-badge {
-        display: inline-flex; align-items: center; gap: 6px;
-        background: rgba(0,229,255,0.08); border: 1px solid rgba(0,229,255,0.2);
-        border-radius: 20px; padding: 3px 12px; font-size: 11px; color: #00e5ff;
-        font-weight: 600; margin-top: 6px;
+    /* ── Vision AI verdict card (now lives inside the Inventory form) ── */
+    .vai-verdict-card {
+        border-radius: 16px; padding: 20px; margin: 12px 0;
+        border: 1.5px solid;
     }
+    .vai-verdict-label {
+        font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
+        text-transform: uppercase; margin-bottom: 4px;
+    }
+    .vai-score-ring-wrap { text-align: center; padding: 10px 0 4px; }
+    .vai-score-num {
+        font-family: 'Syne', sans-serif; font-size: 44px; font-weight: 800;
+        line-height: 1; letter-spacing: -0.03em;
+    }
+    .vai-score-lbl { font-size: 11px; color: #8a9bb0; margin-top: 4px; }
+
+    .vai-metric-row { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+    .vai-metric {
+        flex: 1; min-width: 70px; background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(0,229,255,0.07);
+        border-radius: 10px; padding: 10px 12px; text-align: center;
+    }
+    .vai-metric-val {
+        font-family: 'Syne', sans-serif; font-size: 17px; font-weight: 700;
+        line-height: 1; color: #c8d4e3;
+    }
+    .vai-metric-lbl { font-size: 10px; color: #4a5a72; margin-top: 4px; }
+
+    .vai-flag {
+        display: flex; align-items: flex-start; gap: 8px;
+        background: rgba(255,176,32,0.07); border-left: 3px solid #ffb020;
+        border-radius: 0 8px 8px 0; padding: 8px 12px; margin: 6px 0;
+        font-size: 12px; line-height: 1.5; color: #c8d4e3;
+    }
+    .vai-flag-ok {
+        display: flex; align-items: flex-start; gap: 8px;
+        background: rgba(0,224,150,0.07); border-left: 3px solid #00e096;
+        border-radius: 0 8px 8px 0; padding: 8px 12px; margin: 6px 0;
+        font-size: 12px; line-height: 1.5; color: #c8d4e3;
+    }
+    .vai-ai-section {
+        background: rgba(0,229,255,0.05); border: 1px solid rgba(0,229,255,0.15);
+        border-radius: 12px; padding: 16px; margin-top: 12px;
+    }
+    .vai-ai-label {
+        font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+        text-transform: uppercase; color: #00e5ff; margin-bottom: 8px;
+    }
+    .vai-ai-text { font-size: 12px; line-height: 1.6; color: #c8d4e3; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -1814,17 +1868,281 @@ elif "Inventory" in menu:
     for _sql in [
         "ALTER TABLE products ADD COLUMN image_url TEXT",
         "ALTER TABLE products ADD COLUMN description TEXT",
-        "ALTER TABLE products ADD COLUMN quality_score REAL DEFAULT 0",
+        "ALTER TABLE products ADD COLUMN quality_score REAL DEFAULT 0",   # authenticity score, 0-100
+        "ALTER TABLE products ADD COLUMN vision_analysis TEXT",            # full Vision AI result, JSON
     ]:
         try: _c.execute(_sql); _c.commit()
         except: pass
     _c.close()
 
-    # ── Session: which product is selected for editing ────────────────────────
+    # ── Session state ───────────────────────────────────────────────────────
     if "inv_edit_id" not in st.session_state:
         st.session_state.inv_edit_id = None
     if "inv_tab" not in st.session_state:
         st.session_state.inv_tab = "new"   # "new" | "edit"
+    if "vision_cache" not in st.session_state:
+        st.session_state.vision_cache = {}   # {photo_hash: result_dict}
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # VISION AI ENGINE — pixel-level checks + Claude multimodal analysis
+    # ═════════════════════════════════════════════════════════════════════════
+    def run_vision_analysis(img_bytes, mime_type):
+        """Runs pixel-level authenticity checks plus a Claude vision call on a
+        product photo. Returns a JSON-serialisable dict so it can be cached in
+        session state and saved straight into the vision_analysis DB column."""
+        image = Image.open(_io.BytesIO(img_bytes)).convert("RGB")
+        img_array = np.array(image)
+
+        brightness = float(img_array.mean())
+        contrast   = float(img_array.std())
+        red_mean   = float(img_array[:, :, 0].mean())
+        green_mean = float(img_array[:, :, 1].mean())
+        blue_mean  = float(img_array[:, :, 2].mean())
+        color_var  = float(np.std([red_mean, green_mean, blue_mean]))
+        texture    = float(np.mean(np.abs(np.diff(img_array, axis=0))))
+
+        blurred = ndimage.gaussian_filter(img_array.astype(float), sigma=2)
+        noise_energy = float(np.mean(np.abs(img_array.astype(float) - blurred)))
+
+        gray = np.mean(img_array, axis=2)
+        diff_y = np.abs(np.diff(gray, axis=0))
+        diff_x = np.abs(np.diff(gray, axis=1))
+        edges = diff_y[:, :-1] + diff_x[:-1, :]
+        edge_density = float(np.mean(edges > 15))
+
+        risk_score = 0
+        flags = []
+        if brightness < 60 or brightness > 215:
+            risk_score += 15
+            flags.append("Extreme brightness — suggests artificial or heavily edited lighting")
+        if contrast < 25:
+            risk_score += 20
+            flags.append("Very low contrast — hallmark of AI-generated or heavily smoothed images")
+        if color_var < 6:
+            risk_score += 20
+            flags.append("Unnaturally uniform colour channels — common in AI-generated images")
+        if texture < 8:
+            risk_score += 20
+            flags.append("Low texture complexity — may indicate AI generation or heavy post-processing")
+        if noise_energy < 3.0:
+            risk_score += 15
+            flags.append("Near-zero noise signature — real photographs always contain sensor noise")
+        if edge_density < 0.04:
+            risk_score += 10
+            flags.append("Sparse edge detail — possible over-smoothing or stock/composite image")
+
+        authenticity = max(0, 100 - risk_score)
+
+        pixel_summary = f"""
+Pixel-level analysis:
+- Brightness: {brightness:.1f}/255
+- Contrast (std dev): {contrast:.1f}
+- Colour channel variation (R/G/B spread): {color_var:.2f}
+- Texture score: {texture:.2f}
+- Noise energy: {noise_energy:.2f}
+- Edge density: {edge_density:.3f}
+- Rule-based authenticity score: {authenticity}%
+- Flagged issues: {flags if flags else "none"}
+        """.strip()
+
+        buf = _io.BytesIO()
+        image.save(buf, format="JPEG", quality=85)
+        img_b64 = _b64.b64encode(buf.getvalue()).decode()
+
+        ai_data = None
+        try:
+            api_response = _req.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 1000,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {
+                                "type": "base64", "media_type": "image/jpeg", "data": img_b64
+                            }},
+                            {"type": "text", "text": f"""You are Vision AI, an expert in product image authenticity for e-commerce.
+
+Analyse this product image across three dimensions and respond ONLY as valid JSON — no markdown, no extra text.
+
+Pixel-level metrics for context:
+{pixel_summary}
+
+Return exactly this JSON structure:
+{{
+  "ai_verdict": {{
+    "is_likely_ai": true/false,
+    "confidence": "high"/"medium"/"low",
+    "reasoning": "1-2 sentence explanation of visual evidence for or against AI generation"
+  }},
+  "plagiarism_signals": {{
+    "risk_level": "high"/"medium"/"low"/"none",
+    "signals_found": ["list of up to 3 specific visual signals, or empty array"],
+    "reasoning": "1-2 sentence explanation"
+  }},
+  "quality_assessment": {{
+    "overall_grade": "A"/"B"/"C"/"D"/"F",
+    "strengths": ["up to 2 genuine strengths"],
+    "weaknesses": ["up to 2 genuine weaknesses"],
+    "conversion_impact": "1-2 sentence plain-English business impact"
+  }},
+  "recommendation": "One actionable sentence: what should the seller do next?"
+}}"""}
+                        ]
+                    }]
+                },
+                timeout=30
+            )
+            raw = api_response.json()["content"][0]["text"]
+            clean = raw.replace("```json", "").replace("```", "").strip()
+            ai_data = _json.loads(clean)
+        except Exception:
+            ai_data = None
+
+        return {
+            "brightness": brightness, "contrast": contrast, "texture": texture,
+            "noise_energy": noise_energy, "edge_density": edge_density,
+            "authenticity": authenticity, "flags": flags, "ai_data": ai_data,
+        }
+
+    def get_vision_analysis(img_bytes, mime_type):
+        """Cached wrapper — avoids re-calling the API on every Streamlit rerun
+        (e.g. when the seller is just typing in another field)."""
+        photo_hash = _hashlib.md5(img_bytes).hexdigest()
+        if photo_hash not in st.session_state.vision_cache:
+            with st.spinner("🔬 Running Vision AI photo check..."):
+                st.session_state.vision_cache[photo_hash] = run_vision_analysis(img_bytes, mime_type)
+        return st.session_state.vision_cache[photo_hash]
+
+    def render_vision_card(result):
+        """Renders the full Vision AI verdict: score ring, pixel flags,
+        AI-generation verdict, plagiarism signals, quality grade, business impact."""
+        authenticity = result["authenticity"]
+        flags = result.get("flags", [])
+        ai_data = result.get("ai_data")
+
+        if authenticity >= 75:
+            score_color, score_bg, score_bdr, score_label = "#00e096", "rgba(0,224,150,0.08)", "rgba(0,224,150,0.3)", "Likely Authentic"
+        elif authenticity >= 45:
+            score_color, score_bg, score_bdr, score_label = "#ffb020", "rgba(255,176,32,0.08)", "rgba(255,176,32,0.3)", "Suspicious — Review Needed"
+        else:
+            score_color, score_bg, score_bdr, score_label = "#ff4b6e", "rgba(255,75,110,0.08)", "rgba(255,75,110,0.3)", "High Risk — Likely Fake or Plagiarised"
+
+        st.markdown(f"""
+        <div class="vai-verdict-card" style="background:{score_bg};border-color:{score_bdr};">
+            <div class="vai-verdict-label" style="color:{score_color};">Photo Authenticity Score</div>
+            <div class="vai-score-ring-wrap">
+                <div class="vai-score-num" style="color:{score_color};">{authenticity}%</div>
+                <div class="vai-score-lbl">{score_label}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(f"""
+        <div class="vai-metric-row">
+            <div class="vai-metric"><div class="vai-metric-val">{result.get('brightness',0):.0f}</div><div class="vai-metric-lbl">Brightness</div></div>
+            <div class="vai-metric"><div class="vai-metric-val">{result.get('contrast',0):.0f}</div><div class="vai-metric-lbl">Contrast</div></div>
+            <div class="vai-metric"><div class="vai-metric-val">{result.get('texture',0):.1f}</div><div class="vai-metric-lbl">Texture</div></div>
+            <div class="vai-metric"><div class="vai-metric-val">{result.get('noise_energy',0):.1f}</div><div class="vai-metric-lbl">Noise</div></div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if flags:
+            for msg in flags:
+                st.markdown(f'<div class="vai-flag">⚠️ &nbsp;{msg}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="vai-flag-ok">✅ &nbsp;No pixel-level anomalies detected</div>', unsafe_allow_html=True)
+
+        if ai_data:
+            ai_v   = ai_data.get("ai_verdict", {})
+            plag_v = ai_data.get("plagiarism_signals", {})
+            qual_v = ai_data.get("quality_assessment", {})
+            reco   = ai_data.get("recommendation", "")
+
+            ai_icon  = "🤖" if ai_v.get("is_likely_ai") else "📷"
+            ai_label = "AI-Generated" if ai_v.get("is_likely_ai") else "Appears Human-Taken"
+            ai_conf  = (ai_v.get("confidence") or "").capitalize()
+            st.markdown(f"""
+            <div class="vai-ai-section">
+                <div class="vai-ai-label">🧠 Claude's Deep Analysis</div>
+                <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:14px;">
+                    <div style="font-size:26px;line-height:1;">{ai_icon}</div>
+                    <div>
+                        <div style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;color:#e8eef7;">{ai_label} <span style="font-size:11px;font-weight:400;color:#4a5a72;">({ai_conf} confidence)</span></div>
+                        <div class="vai-ai-text">{ai_v.get("reasoning", "")}</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            p_risk = plag_v.get("risk_level", "none")
+            p_map  = {"high": ("🚨", "#ff4b6e"), "medium": ("⚠️", "#ffb020"),
+                      "low": ("🔶", "#ffb020"), "none": ("✅", "#00e096")}
+            p_ico, p_col = p_map.get(p_risk, p_map["none"])
+            p_signals = plag_v.get("signals_found", [])
+
+            st.markdown(f"""
+            <div style="margin-top:14px;">
+                <div style="font-size:11px;font-weight:700;letter-spacing:0.07em;text-transform:uppercase;
+                    color:{p_col};margin-bottom:6px;">🔍 Plagiarism Risk — {p_risk.upper()}</div>
+                <div class="vai-ai-text">{plag_v.get("reasoning","")}</div>
+                {"".join(f'<div class="vai-flag">{p_ico}&nbsp;{s}</div>' for s in p_signals) if p_signals else '<div class="vai-flag-ok">✅ &nbsp;No stock photo or plagiarism signals detected</div>'}
+            </div>
+            """, unsafe_allow_html=True)
+
+            grade   = qual_v.get("overall_grade", "?")
+            g_color = {"A":"#00e096","B":"#7be05a","C":"#ffb020","D":"#ff7a4b","F":"#ff4b6e"}.get(grade, "#888")
+            strengths  = qual_v.get("strengths", [])
+            weaknesses = qual_v.get("weaknesses", [])
+
+            st.markdown(f"""
+            <div style="margin-top:16px;display:flex;gap:14px;align-items:flex-start;">
+                <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(0,229,255,0.08);border-radius:12px;padding:10px 16px;text-align:center;min-width:58px;">
+                    <div style="font-family:'Syne',sans-serif;font-size:32px;font-weight:800;color:{g_color};line-height:1;">{grade}</div>
+                    <div style="font-size:9px;color:#4a5a72;margin-top:2px;">QUALITY</div>
+                </div>
+                <div style="flex:1;">
+                    {"".join(f'<div class="vai-flag-ok">✅ &nbsp;{s}</div>' for s in strengths)}
+                    {"".join(f'<div class="vai-flag">⚠️ &nbsp;{w}</div>' for w in weaknesses)}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(f"""
+            <div style="margin-top:16px;background:rgba(255,255,255,0.03);border:1px solid rgba(0,229,255,0.07);border-radius:12px;padding:14px;">
+                <div style="font-size:10px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;
+                    color:#4a5a72;margin-bottom:8px;">📈 Business Impact</div>
+                <div class="vai-ai-text">{qual_v.get("conversion_impact","")}</div>
+                {"" if not reco else f'<div style="margin-top:10px;font-size:12px;font-weight:600;color:#e8eef7;">→ {reco}</div>'}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            if authenticity < 50:
+                st.error("⚠️ High-risk image. Likely to reduce buyer trust and hurt conversion rates. Consider replacing before listing.")
+            elif authenticity < 75:
+                st.warning("🔶 Moderate concern. Improving image quality could meaningfully boost conversions.")
+            else:
+                st.success("✅ Image quality looks solid — supports buyer confidence.")
+
+    def _auth_cell(score):
+        if not score or score <= 0:
+            return "<td class='no-img'>—</td>"
+        if score >= 75:
+            return f"<td class='auth-high'>✓ {score:.0f}</td>"
+        elif score >= 45:
+            return f"<td class='auth-mid'>⚠ {score:.0f}</td>"
+        return f"<td class='auth-low'>🚨 {score:.0f}</td>"
+
+    def _grade_cell(vision_json):
+        if not vision_json:
+            return "<td class='muted'>—</td>"
+        try:
+            grade = (_json.loads(vision_json).get("ai_data") or {}).get("quality_assessment", {}).get("overall_grade")
+        except Exception:
+            grade = None
+        return f"<td class='cyan'>{grade}</td>" if grade else "<td class='muted'>—</td>"
 
     st.markdown("# Inventory")
 
@@ -1841,8 +2159,8 @@ elif "Inventory" in menu:
 
             _c2 = sqlite3.connect("venus_ai.db")
             inv_data = _c2.execute(
-                "SELECT id, product, price, qty, location, image_url, description, quality_score "
-                "FROM products WHERE user_id=? ORDER BY id DESC",
+                "SELECT id, product, price, qty, location, image_url, description, "
+                "quality_score, vision_analysis FROM products WHERE user_id=? ORDER BY id DESC",
                 (user["id"],)
             ).fetchall()
             _c2.close()
@@ -1858,22 +2176,19 @@ elif "Inventory" in menu:
                 with m3: st.metric("Avg Price", f"${avg_p:.2f}")
                 st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
 
-                # Build table
                 rows_html = ""
                 for r in inv_data:
-                    pid       = r[0]
                     prod      = str(r[1])
                     price_str = f"${float(r[2] or 0):,.2f}"
                     qty       = int(r[3] or 0)
                     loc       = str(r[4] or "—")
                     has_img   = bool(r[5])
-                    has_desc  = bool(r[6])
                     qs        = float(r[7] or 0)
+                    vision_js = r[8]
 
                     stock_cls = "stock-low" if qty < 5 else "stock-ok" if qty >= 20 else ""
                     stock_lbl = f"{qty} ⚠" if qty < 5 else str(qty)
                     img_cell  = "<td class='has-img'>✓ Photo</td>" if has_img else "<td class='no-img'>No photo</td>"
-                    qs_cell   = f"<td class='cyan'>{qs:.0f}</td>" if qs > 0 else "<td class='muted'>—</td>"
 
                     rows_html += (
                         f"<tr>"
@@ -1882,19 +2197,19 @@ elif "Inventory" in menu:
                         f"<td class='{stock_cls}'>{stock_lbl}</td>"
                         f"<td class='muted'>{loc}</td>"
                         f"{img_cell}"
-                        f"{qs_cell}"
+                        f"{_auth_cell(qs)}"
+                        f"{_grade_cell(vision_js)}"
                         f"</tr>"
                     )
 
                 st.markdown(
                     f"<table class='inv-table'><thead><tr>"
                     f"<th>Product</th><th>Price</th><th>Stock</th>"
-                    f"<th>Location</th><th>Image</th><th>Quality</th>"
+                    f"<th>Location</th><th>Image</th><th>AI Check</th><th>Grade</th>"
                     f"</tr></thead><tbody>{rows_html}</tbody></table>",
                     unsafe_allow_html=True
                 )
 
-                # Edit selector
                 st.markdown('<div style="height:16px;"></div>', unsafe_allow_html=True)
                 prod_options = {r[0]: str(r[1]) for r in inv_data}
                 sel_id = st.selectbox(
@@ -1921,7 +2236,6 @@ elif "Inventory" in menu:
         # ── RIGHT: Form panel ─────────────────────────────────────────────────
         with col_form:
 
-            # Tab switcher
             tab_new  = st.session_state.inv_tab == "new"
             tab_edit = st.session_state.inv_tab == "edit"
             tc1, tc2 = st.columns(2)
@@ -1955,7 +2269,6 @@ elif "Inventory" in menu:
                     height=90, key="new_desc"
                 )
 
-                # Image upload
                 st.markdown('<div style="font-size:11px;font-weight:600;color:#4a5a72;'
                             'text-transform:uppercase;letter-spacing:0.08em;margin:10px 0 6px;">Product Photo</div>',
                             unsafe_allow_html=True)
@@ -1964,15 +2277,31 @@ elif "Inventory" in menu:
                     key="new_img", label_visibility="collapsed"
                 )
 
+                new_vision_result = None
                 if new_img_file:
                     img_bytes = new_img_file.read()
                     img_b64   = _b64.b64encode(img_bytes).decode()
                     img_data_uri = f"data:{new_img_file.type};base64,{img_b64}"
                     st.markdown(f'<img src="{img_data_uri}" class="inv-img-preview">', unsafe_allow_html=True)
+
+                    # 🔬 Vision AI runs automatically on every uploaded photo
+                    new_vision_result = get_vision_analysis(img_bytes, new_img_file.type)
+                    render_vision_card(new_vision_result)
                 else:
                     st.markdown('<div class="inv-img-placeholder">📷</div>', unsafe_allow_html=True)
+                    with st.expander("💡 What makes a product image trustworthy?"):
+                        st.markdown("""
+                        Buyers make snap judgments in under 200ms — your image signals
+                        authenticity before a single word is read.
 
-                # Supplier info strip
+                        **Red flags that kill conversions:** obvious AI-generation artifacts,
+                        watermarked or heavily filtered stock photos, flat shadowless lighting,
+                        off-brand colour grading.
+
+                        Upload a photo above and Vision AI will automatically score it for
+                        authenticity, plagiarism risk, and overall quality.
+                        """)
+
                 sup_name = user.get("name", "Not set")
                 sup_loc  = user.get("location", "Not set")
                 st.markdown(
@@ -1990,51 +2319,21 @@ elif "Inventory" in menu:
 
                 if st.button("List Product", key="new_submit", use_container_width=True):
                     if new_name.strip():
-                        img_url = img_data_uri if new_img_file else None
-
-                        # Run Vision AI quality score if image uploaded
-                        qs = 0.0
-                        if new_img_file and img_bytes:
-                            try:
-                                import requests as _req
-                                import json as _json
-                                _vr = _req.post(
-                                    "https://api.anthropic.com/v1/messages",
-                                    headers={"Content-Type": "application/json"},
-                                    json={
-                                        "model": "claude-sonnet-4-20250514",
-                                        "max_tokens": 60,
-                                        "messages": [{
-                                            "role": "user",
-                                            "content": [
-                                                {"type": "image", "source": {
-                                                    "type": "base64",
-                                                    "media_type": new_img_file.type,
-                                                    "data": img_b64
-                                                }},
-                                                {"type": "text", "text":
-                                                    "Rate this product image quality for e-commerce on a scale of 0-100. "
-                                                    "Consider lighting, clarity, background, and professionalism. "
-                                                    "Reply with ONLY a number between 0 and 100, nothing else."}
-                                            ]
-                                        }]
-                                    }, timeout=20
-                                )
-                                qs = float(_vr.json()["content"][0]["text"].strip())
-                            except:
-                                qs = 50.0
+                        img_url   = img_data_uri if new_img_file else None
+                        qs        = new_vision_result["authenticity"] if new_vision_result else 0.0
+                        vision_js = _json.dumps(new_vision_result) if new_vision_result else None
 
                         cursor.execute(
                             "INSERT INTO products (user_id, product, price, qty, supplier, location, "
-                            "image_url, description, quality_score) VALUES (?,?,?,?,?,?,?,?,?)",
+                            "image_url, description, quality_score, vision_analysis) VALUES (?,?,?,?,?,?,?,?,?,?)",
                             (user["id"], new_name.strip(), new_price, new_qty,
                              user.get("name","Unknown"), user.get("location","Unknown"),
-                             img_url, new_desc.strip() or None, qs)
+                             img_url, new_desc.strip() or None, qs, vision_js)
                         )
                         conn.commit()
 
                         if qs > 0:
-                            st.success(f"{new_name} listed! Image quality score: {qs:.0f}/100")
+                            st.success(f"{new_name} listed! Photo authenticity score: {qs:.0f}/100")
                         else:
                             st.success(f"{new_name} listed successfully!")
                         st.rerun()
@@ -2052,8 +2351,8 @@ elif "Inventory" in menu:
                 else:
                     _c3 = sqlite3.connect("venus_ai.db")
                     ep = _c3.execute(
-                        "SELECT id, product, price, qty, location, image_url, description, quality_score "
-                        "FROM products WHERE id=? AND user_id=?",
+                        "SELECT id, product, price, qty, location, image_url, description, "
+                        "quality_score, vision_analysis FROM products WHERE id=? AND user_id=?",
                         (edit_id, user["id"])
                     ).fetchone()
                     _c3.close()
@@ -2064,13 +2363,14 @@ elif "Inventory" in menu:
                         st.markdown('<div class="inv-panel">', unsafe_allow_html=True)
                         st.markdown('<div class="inv-panel-title">Edit Product</div>', unsafe_allow_html=True)
 
-                        ep_name  = str(ep[1])
-                        ep_price = float(ep[2] or 0)
-                        ep_qty   = int(ep[3] or 0)
-                        ep_loc   = str(ep[4] or "")
-                        ep_img   = ep[5]
-                        ep_desc  = str(ep[6] or "")
-                        ep_qs    = float(ep[7] or 0)
+                        ep_name   = str(ep[1])
+                        ep_price  = float(ep[2] or 0)
+                        ep_qty    = int(ep[3] or 0)
+                        ep_loc    = str(ep[4] or "")
+                        ep_img    = ep[5]
+                        ep_desc   = str(ep[6] or "")
+                        ep_qs     = float(ep[7] or 0)
+                        ep_vision = _json.loads(ep[8]) if ep[8] else None
 
                         e_name  = st.text_input("Product Name",  value=ep_name,  key="e_name")
                         e_price = st.number_input("Price (USD)", value=ep_price, min_value=0.0, step=0.5, key="e_price")
@@ -2081,18 +2381,12 @@ elif "Inventory" in menu:
                             placeholder="Describe your product..."
                         )
 
-                        # Current image
                         st.markdown('<div style="font-size:11px;font-weight:600;color:#4a5a72;'
                                     'text-transform:uppercase;letter-spacing:0.08em;'
                                     'margin:10px 0 6px;">Product Photo</div>',
                                     unsafe_allow_html=True)
                         if ep_img:
                             st.markdown(f'<img src="{ep_img}" class="inv-img-preview">', unsafe_allow_html=True)
-                            if ep_qs > 0:
-                                st.markdown(
-                                    f'<div class="inv-quality-badge">AI Quality: {ep_qs:.0f}/100</div>',
-                                    unsafe_allow_html=True
-                                )
                         else:
                             st.markdown('<div class="inv-img-placeholder">📷</div>', unsafe_allow_html=True)
 
@@ -2101,15 +2395,23 @@ elif "Inventory" in menu:
                             key=f"e_img_{edit_id}", label_visibility="collapsed"
                         )
 
+                        e_vision_result = None
                         if e_img_file:
                             e_img_bytes = e_img_file.read()
                             e_img_b64   = _b64.b64encode(e_img_bytes).decode()
                             e_img_uri   = f"data:{e_img_file.type};base64,{e_img_b64}"
                             st.markdown(f'<img src="{e_img_uri}" class="inv-img-preview">', unsafe_allow_html=True)
+
+                            # 🔬 New photo → fresh Vision AI run
+                            e_vision_result = get_vision_analysis(e_img_bytes, e_img_file.type)
+                            render_vision_card(e_vision_result)
                         else:
-                            e_img_uri   = None
-                            e_img_bytes = None
-                            e_img_b64   = None
+                            e_img_uri = None
+                            # Show the existing stored Vision AI analysis, if any
+                            if ep_vision:
+                                render_vision_card(ep_vision)
+                            elif ep_img:
+                                st.caption("No Vision AI analysis on file yet for this photo.")
 
                         st.markdown('<div style="height:6px;"></div>', unsafe_allow_html=True)
                         sa, sb = st.columns(2)
@@ -2117,42 +2419,17 @@ elif "Inventory" in menu:
                         with sa:
                             if st.button("Save Changes", key="e_save", use_container_width=True):
                                 final_img = e_img_uri if e_img_file else ep_img
-                                new_qs    = ep_qs
 
-                                # Re-score image if new one uploaded
-                                if e_img_file and e_img_bytes:
-                                    try:
-                                        import requests as _req
-                                        _vr = _req.post(
-                                            "https://api.anthropic.com/v1/messages",
-                                            headers={"Content-Type": "application/json"},
-                                            json={
-                                                "model": "claude-sonnet-4-20250514",
-                                                "max_tokens": 60,
-                                                "messages": [{
-                                                    "role": "user",
-                                                    "content": [
-                                                        {"type": "image", "source": {
-                                                            "type": "base64",
-                                                            "media_type": e_img_file.type,
-                                                            "data": e_img_b64
-                                                        }},
-                                                        {"type": "text", "text":
-                                                            "Rate this product image quality for e-commerce 0-100. "
-                                                            "Reply with ONLY a number, nothing else."}
-                                                    ]
-                                                }]
-                                            }, timeout=20
-                                        )
-                                        new_qs = float(_vr.json()["content"][0]["text"].strip())
-                                    except:
-                                        new_qs = ep_qs
+                                if e_vision_result:
+                                    final_qs, final_vision_js = e_vision_result["authenticity"], _json.dumps(e_vision_result)
+                                else:
+                                    final_qs, final_vision_js = ep_qs, (_json.dumps(ep_vision) if ep_vision else None)
 
                                 cursor.execute(
                                     "UPDATE products SET product=?, price=?, qty=?, location=?, "
-                                    "description=?, image_url=?, quality_score=? WHERE id=?",
+                                    "description=?, image_url=?, quality_score=?, vision_analysis=? WHERE id=?",
                                     (e_name.strip(), e_price, e_qty, e_loc.strip(),
-                                     e_desc.strip() or None, final_img, new_qs, edit_id)
+                                     e_desc.strip() or None, final_img, final_qs, final_vision_js, edit_id)
                                 )
                                 conn.commit()
                                 st.success("Product updated!")
@@ -2173,14 +2450,15 @@ elif "Inventory" in menu:
                         st.markdown('</div>', unsafe_allow_html=True)
 
     # ═════════════════════════════════════════════════════════════════════════
-    # CUSTOMER VIEW — read-only
+    # CUSTOMER VIEW — read-only, with AI Check trust signal
     # ═════════════════════════════════════════════════════════════════════════
     else:
         st.markdown('<div class="section-label">All marketplace products</div>', unsafe_allow_html=True)
 
         _c2 = sqlite3.connect("venus_ai.db")
         inv_data = _c2.execute(
-            "SELECT product, price, qty, supplier, location FROM products ORDER BY id DESC"
+            "SELECT product, price, qty, supplier, location, quality_score, vision_analysis "
+            "FROM products ORDER BY id DESC"
         ).fetchall()
         _c2.close()
 
@@ -2199,6 +2477,8 @@ elif "Inventory" in menu:
             rows_html = ""
             for r in inv_data:
                 qty       = int(r[2] or 0)
+                qs        = float(r[5] or 0)
+                vision_js = r[6]
                 stock_cls = "stock-low" if qty < 5 else "stock-ok" if qty >= 20 else ""
                 stock_lbl = f"{qty} ⚠" if qty < 5 else str(qty)
                 rows_html += (
@@ -2208,15 +2488,18 @@ elif "Inventory" in menu:
                     f"<td class='{stock_cls}'>{stock_lbl}</td>"
                     f"<td class='muted'>{r[3] or '—'}</td>"
                     f"<td class='muted'>{r[4] or '—'}</td>"
+                    f"{_auth_cell(qs)}"
+                    f"{_grade_cell(vision_js)}"
                     f"</tr>"
                 )
             st.markdown(
                 f"<table class='inv-table'><thead><tr>"
                 f"<th>Product</th><th>Price</th><th>Stock</th>"
-                f"<th>Supplier</th><th>Location</th>"
+                f"<th>Supplier</th><th>Location</th><th>AI Check</th><th>Grade</th>"
                 f"</tr></thead><tbody>{rows_html}</tbody></table>",
                 unsafe_allow_html=True
             )
+            st.caption("AI Check reflects Vision AI's automated photo-authenticity score — higher is better.")
         else:
             st.info("No products in the marketplace yet.")
             
@@ -2754,1508 +3037,6 @@ elif "Prediction" in menu:
             </div>
         </div>""", unsafe_allow_html=True)
 
-# =========================================================
-# MARKETING AI — Magazine-style editable poster templates
-# =========================================================
-elif "Marketing AI" in menu:
-    import io, random
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-    st.markdown("# 📣 Marketing AI")
-    st.markdown('<div class="section-label">Magazine-quality ad templates · Social media ready · Fully editable</div>', unsafe_allow_html=True)
-
-    # ── Marketing CSS ──
-    st.markdown("""
-    <style>
-    .poster-wrap {
-        border-radius: 16px; overflow: hidden;
-        border: 1px solid rgba(0,229,255,0.12);
-        box-shadow: 0 12px 40px rgba(0,0,0,0.5);
-        transition: transform 0.2s, box-shadow 0.2s;
-        cursor: pointer;
-    }
-    .poster-wrap:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 20px 60px rgba(0,0,0,0.7);
-    }
-    .template-label {
-        font-size:10px;font-weight:700;letter-spacing:.1em;
-        text-transform:uppercase;color:#9aaabf;margin-bottom:6px;
-    }
-    .copy-card {
-        background: rgba(255,255,255,0.02);
-        border: 1px solid rgba(0,229,255,0.08);
-        border-radius: 12px;
-        padding: 14px 16px;
-        margin-bottom: 10px;
-        position: relative;
-    }
-    .copy-platform {
-        font-size:10px;font-weight:700;letter-spacing:.08em;
-        text-transform:uppercase;margin-bottom:6px;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    conn2 = sqlite3.connect("venus_ai.db")
-    cursor2 = conn2.cursor()
-    if st.session_state.role == "Supplier":
-        cursor2.execute("SELECT product, price, qty, supplier, location FROM products WHERE user_id = ?", (user["id"],))
-    else:
-        cursor2.execute("SELECT product, price, qty, supplier, location FROM products")
-    rows = cursor2.fetchall()
-    conn2.close()
-
-    if not rows:
-        st.info("No inventory available. Add products first.")
-    else:
-        df = pd.DataFrame(rows, columns=["product","price","qty","supplier","location"])
-
-        # ── Controls ──
-        ctrl1, ctrl2, ctrl3 = st.columns([1.5, 1, 1])
-        with ctrl1:
-            product   = st.selectbox("Product", df["product"], key="mkt_prod")
-        with ctrl2:
-            user_location = st.text_input("Target Market", value="Lusaka", key="mkt_loc")
-        with ctrl3:
-            template_style = st.selectbox("Visual Style", [
-                "🌃 Dark Luxury", "🌿 Fresh & Natural", "🔥 Bold Sale", "💎 Premium Minimal"
-            ], key="mkt_style")
-
-        item      = df[df["product"] == product].iloc[0]
-        price_val = float(item["price"])
-        supplier  = str(item.get("supplier","Your Brand"))
-        np.random.seed(abs(hash(product)) % 9999)
-        demand_score      = round(np.random.uniform(0.4, 0.98), 2)
-        competitor_count  = df[(df["location"].str.lower()==user_location.lower())].shape[0]
-
-        # ── Editable copy fields ──
-        st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-        st.markdown("### ✏️ Customise Your Ad Copy")
-        st.markdown('<div class="section-label">Edit any field — posters update live when you regenerate</div>', unsafe_allow_html=True)
-
-        ec1, ec2 = st.columns(2)
-        with ec1:
-            headline   = st.text_input("Headline",    value=f"Don't Miss Out on {product}!", key="mkt_headline")
-            subline    = st.text_input("Subheadline", value=f"Premium quality · Only ${price_val:.0f}", key="mkt_sub")
-            tagline    = st.text_input("Tagline",     value=f"Available now in {user_location}", key="mkt_tag")
-        with ec2:
-            cta_text   = st.text_input("Call to Action", value="Order Now →", key="mkt_cta")
-            badge_text = st.text_input("Badge Text",     value="HOT DEAL", key="mkt_badge")
-            brand_name = st.text_input("Brand / Store",  value=supplier, key="mkt_brand")
-
-        gen_btn = st.button("🎨 Generate Magazine Posters", key="mkt_gen", use_container_width=False)
-
-        if gen_btn or st.session_state.get("mkt_generated_for") == product:
-            st.session_state["mkt_generated_for"] = product
-
-            # ── Poster generation function ──
-            def make_poster(style, w=800, h=1000):
-                img = Image.new("RGB", (w, h), (10,12,20))
-                draw = ImageDraw.Draw(img)
-
-                try:
-                    font_xl  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 58)
-                    font_lg  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-                    font_md  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",     26)
-                    font_sm  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",     20)
-                    font_xs  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",18)
-                except:
-                    font_xl = font_lg = font_md = font_sm = font_xs = ImageFont.load_default()
-
-                if style == "🌃 Dark Luxury":
-                    bg     = (8, 10, 18)
-                    accent = (0, 229, 255)
-                    acc2   = (168, 85, 247)
-                    text_c = (232, 237, 245)
-                    muted  = (90, 106, 130)
-                    # Background gradient effect
-                    for y in range(h):
-                        t = y/h
-                        r = int(8  + 4*t)
-                        g = int(10 + 6*t)
-                        b = int(18 + 20*t)
-                        draw.line([(0,y),(w,y)], fill=(r,g,b))
-                    # Cyan glow top-left — draw directly on RGBA overlay then composite
-                    glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-                    gd = ImageDraw.Draw(glow)
-                    for r_g in range(300, 10, -10):
-                        alpha = int(20 * (1 - r_g / 300))
-                        x0 = int(-r_g // 2)
-                        y0 = int(-r_g // 2)
-                        x1 = int(r_g)
-                        y1 = int(r_g)
-                        gd.ellipse((x0, y0, x1, y1), fill=(0, 229, 255, alpha))
-                    base_rgba = img.convert("RGBA")
-                    img = Image.alpha_composite(base_rgba, glow).convert("RGB")
-                    draw = ImageDraw.Draw(img)
-                    # Top accent bar
-                    draw.rectangle([(0,0),(w,5)], fill=accent)
-                    # Brand
-                    draw.text((50,28), brand_name.upper(), fill=muted, font=font_xs)
-                    # Price badge
-                    draw.rounded_rectangle([(w-180,20),(w-20,70)], radius=8, fill=accent)
-                    draw.text((w-170,30), f"${price_val:.0f}", fill=(0,0,0), font=font_lg)
-                    # Product name hero
-                    draw.text((50,120), product.upper(), fill=accent, font=font_xl)
-                    # Accent line
-                    draw.rectangle([(50,200),(w-50,203)], fill=(0,229,255,80))
-                    # Headline
-                    _wrap_text(draw, headline, font_lg, text_c, 50, 220, w-100)
-                    # Subline
-                    _wrap_text(draw, subline, font_md, muted, 50, 310, w-100)
-                    # Tagline
-                    _wrap_text(draw, tagline, font_sm, (80,100,140), 50, 370, w-100)
-                    # Stats row
-                    stats = [("DEMAND",f"{int(demand_score*100)}%"),("MARKET",user_location),("STOCK",str(int(item['qty'])))]
-                    for si,(sl,sv) in enumerate(stats):
-                        sx = 50 + si*240
-                        draw.text((sx,460), sl, fill=muted, font=font_xs)
-                        draw.text((sx,483), sv, fill=text_c, font=font_lg)
-                    draw.rectangle([(50,550),(w-50,552)], fill=(30,40,60))
-                    # CTA button
-                    draw.rounded_rectangle([(50,580),(50+len(cta_text)*22,640)], radius=12, fill=accent)
-                    draw.text((66,592), cta_text, fill=(0,0,0), font=font_lg)
-                    # Badge
-                    draw.rounded_rectangle([(50,680),(50+len(badge_text)*16,720)], radius=6,
-                        outline=acc2, width=2)
-                    draw.text((60,684), badge_text, fill=acc2, font=font_sm)
-                    # Bottom
-                    draw.rectangle([(0,h-50),(w,h)], fill=(0,229,255,30))
-                    draw.text((50,h-38), f"VENUS AI · Powered by Market Intelligence · {user_location.upper()}", fill=muted, font=font_xs)
-
-                elif style == "🌿 Fresh & Natural":
-                    bg     = (18,30,22)
-                    accent = (0,224,150)
-                    text_c = (230,245,235)
-                    muted  = (80,120,90)
-                    for y in range(h):
-                        t = y/h
-                        draw.line([(0,y),(w,y)], fill=(int(18+12*t),int(30+20*t),int(22+15*t)))
-                    draw.rectangle([(0,0),(w,6)], fill=accent)
-                    draw.text((50,28), brand_name.upper(), fill=muted, font=font_xs)
-                    draw.rounded_rectangle([(w-180,18),(w-20,72)], radius=30, fill=accent)
-                    draw.text((w-168,28), f"${price_val:.0f}", fill=(10,20,14), font=font_lg)
-                    draw.text((50,110), "🌿 " + product.upper(), fill=accent, font=font_xl)
-                    draw.rectangle([(50,195),(w-50,197)], fill=muted)
-                    _wrap_text(draw, headline, font_lg, text_c, 50,215,w-100)
-                    _wrap_text(draw, subline, font_md, muted, 50,305,w-100)
-                    _wrap_text(draw, tagline, font_sm, (60,100,70), 50,365,w-100)
-                    draw.rounded_rectangle([(50,440),(w-50,510)], radius=14,
-                        fill=(0,224,150,30), outline=accent, width=1)
-                    draw.text((70,455), f"✓ {badge_text}  ·  {int(demand_score*100)}% demand  ·  {competitor_count} competitors", fill=accent, font=font_sm)
-                    draw.rounded_rectangle([(50,550),(50+len(cta_text)*22,614)], radius=30, fill=accent)
-                    draw.text((66,562), cta_text, fill=(10,20,14), font=font_lg)
-                    draw.text((50,660), user_location.upper(), fill=muted, font=font_md)
-                    draw.rectangle([(0,h-50),(w,h)], fill=(0,50,20))
-                    draw.text((50,h-38), f"VENUS AI · {brand_name} · {user_location}", fill=muted, font=font_xs)
-
-                elif style == "🔥 Bold Sale":
-                    for y in range(h):
-                        t = y/h
-                        draw.line([(0,y),(w,y)], fill=(int(40+60*t),int(8+4*t),int(8+4*t)))
-                    accent = (255,75,110)
-                    text_c = (255,240,240)
-                    muted  = (180,100,100)
-                    # Diagonal stripe decoration
-                    for i in range(-5,20):
-                        x = i*80
-                        draw.polygon([(x,0),(x+40,0),(x+40+h,h),(x+h,h)], fill=(255,255,255,8))
-                    draw.rectangle([(0,0),(w,8)], fill=(255,75,110))
-                    draw.text((50,25), brand_name.upper(), fill=(180,100,100), font=font_xs)
-                    # Huge SALE badge
-                    draw.rounded_rectangle([(w-200,15),(w-15,80)], radius=10, fill=(255,75,110))
-                    draw.text((w-185,22), "SALE", fill=(255,255,255), font=font_xl)
-                    draw.text((50,100), "🔥 " + product.upper(), fill=(255,240,240), font=font_xl)
-                    draw.rectangle([(50,185),(w-50,188)], fill=(255,75,110))
-                    _wrap_text(draw, headline, font_lg, text_c, 50,205,w-100)
-                    _wrap_text(draw, subline, font_md, muted, 50,295,w-100)
-                    # Big price
-                    draw.text((50,380), f"${price_val:.0f}", fill=(255,75,110), font=font_xl)
-                    draw.text((50+len(f"${price_val:.0f}")*32,415), "only", fill=(180,100,100), font=font_md)
-                    _wrap_text(draw, tagline, font_sm, (180,100,100), 50,470,w-100)
-                    draw.rounded_rectangle([(50,540),(50+len(cta_text)*22+20,605)], radius=8, fill=(255,75,110))
-                    draw.text((62,553), cta_text, fill=(255,255,255), font=font_lg)
-                    draw.text((50,650), f"⚡ {badge_text}", fill=(255,200,50), font=font_md)
-                    draw.rectangle([(0,h-50),(w,h)], fill=(80,10,10))
-                    draw.text((50,h-38), f"VENUS AI · {user_location.upper()} · Limited Time", fill=(150,80,80), font=font_xs)
-
-                else:  # 💎 Premium Minimal
-                    for y in range(h):
-                        t = y/h
-                        draw.line([(0,y),(w,y)], fill=(int(245-30*t),int(245-30*t),int(250-30*t)))
-                    accent = (10,10,30)
-                    gold   = (180,140,60)
-                    text_c = (20,20,40)
-                    muted  = (140,140,160)
-                    draw.rectangle([(0,0),(w,4)], fill=gold)
-                    draw.text((50,24), brand_name.upper(), fill=gold, font=font_xs)
-                    draw.text((w-200,24), f"${price_val:.0f}", fill=accent, font=font_lg)
-                    draw.line([(50,80),(w-50,80)], fill=(200,200,220), width=1)
-                    draw.text((50,100), product.upper(), fill=accent, font=font_xl)
-                    draw.line([(50,195),(w-50,195)], fill=gold, width=2)
-                    _wrap_text(draw, headline, font_lg, accent, 50,215,w-100)
-                    _wrap_text(draw, subline, font_md, muted, 50,305,w-100)
-                    draw.line([(50,380),(w-50,380)], fill=(200,200,220), width=1)
-                    draw.text((50,395), badge_text.upper(), fill=gold, font=font_md)
-                    _wrap_text(draw, tagline, font_sm, muted, 50,440,w-100)
-                    # Minimal CTA
-                    cta_w = len(cta_text)*18 + 40
-                    draw.rectangle([(50,520),(50+cta_w,570)], fill=accent)
-                    draw.text((66,530), cta_text, fill=(240,240,250), font=font_lg)
-                    draw.text((50,610), f"{int(demand_score*100)}% DEMAND SCORE · {user_location.upper()}", fill=muted, font=font_xs)
-                    draw.rectangle([(0,h-50),(w,h)], fill=gold)
-                    draw.text((50,h-38), f"VENUS AI · {brand_name}", fill=(50,30,0), font=font_xs)
-
-                return img
-
-            def _wrap_text(draw, text, font, color, x, y, max_w):
-                words = text.split()
-                line = ""
-                cy = y
-                for word in words:
-                    test = line + word + " "
-                    try:
-                        tw = draw.textlength(test, font=font)
-                    except:
-                        tw = len(test)*14
-                    if tw > max_w and line:
-                        draw.text((x, cy), line.strip(), fill=color, font=font)
-                        try: lh = font.getbbox("A")[3]
-                        except: lh = 30
-                        cy += lh + 6
-                        line = word + " "
-                    else:
-                        line = test
-                if line:
-                    draw.text((x, cy), line.strip(), fill=color, font=font)
-
-            st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-            st.markdown("### 🖼️ Your Magazine-Quality Posters")
-            st.markdown('<div class="section-label">Download or share directly to social media</div>', unsafe_allow_html=True)
-
-            styles = ["🌃 Dark Luxury","🌿 Fresh & Natural","🔥 Bold Sale","💎 Premium Minimal"]
-            style_map = {
-                "🌃 Dark Luxury":     ("DARK LUXURY",  "#00e5ff"),
-                "🌿 Fresh & Natural": ("FRESH & NATURAL","#00e096"),
-                "🔥 Bold Sale":       ("BOLD SALE",    "#ff4b6e"),
-                "💎 Premium Minimal": ("PREMIUM",      "#c8a84b"),
-            }
-
-            # Show all 4 styles in a 2x2 grid
-            row1 = st.columns(2)
-            row2 = st.columns(2)
-            all_cols = row1 + row2
-
-            for ci, sty in enumerate(styles):
-                label_txt, label_col = style_map[sty]
-                poster_img = make_poster(sty)
-                buf = io.BytesIO()
-                poster_img.save(buf, format="PNG", quality=95)
-                buf.seek(0)
-                poster_bytes = buf.getvalue()
-
-                with all_cols[ci]:
-                    st.markdown(f'<div class="template-label" style="color:{label_col};">{label_txt}</div>', unsafe_allow_html=True)
-                    st.image(poster_bytes, use_container_width=True)
-
-                    dl_col, share_col = st.columns(2)
-                    with dl_col:
-                        st.download_button(
-                            "⬇ Download",
-                            data=poster_bytes,
-                            file_name=f"{product.replace(' ','_')}_{sty.split()[1]}.png",
-                            mime="image/png",
-                            key=f"dl_{ci}",
-                            use_container_width=True
-                        )
-                    with share_col:
-                        if st.button("📤 Share", key=f"share_{ci}", use_container_width=True):
-                            st.info("Copy the downloaded image and post to Instagram, TikTok, Facebook, or WhatsApp!")
-
-            # ── Editable Ad Copy bank ──
-            st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-            st.markdown("### 📝 Ad Copy Library")
-            st.markdown('<div class="section-label">Ready-to-paste captions for every platform</div>', unsafe_allow_html=True)
-
-            copies = {
-                "Instagram / Facebook": {
-                    "color": "#a855f7",
-                    "copy": f"✨ {headline}\n\n{subline}\n{tagline}\n\n💥 {badge_text} — grab yours before it's gone!\n\n📍 {user_location} | 🛒 {cta_text}\n\n#trending #{product.replace(' ','')} #shoplocal #{user_location.replace(' ','')} #venusai"
-                },
-                "TikTok / Reels": {
-                    "color": "#ff4b6e",
-                    "copy": f"🔥 POV: You just found the best deal on {product}!\n\n{headline} 💥\n{subline}\n\n{cta_text} — link in bio! 🛒\n\n#fyp #{product.replace(' ','')} #deal #shoplocal"
-                },
-                "WhatsApp Broadcast": {
-                    "color": "#00e096",
-                    "copy": f"🌟 *{headline}*\n\n_{subline}_\n\n✅ {badge_text}\n📍 Available in {user_location}\n💰 Only *${price_val:.0f}*\n\n👉 {cta_text}"
-                },
-                "Twitter / X": {
-                    "color": "#00e5ff",
-                    "copy": f"{headline} 🔥\n\n{subline} | {user_location}\n\n{cta_text} ➡️ #{product.replace(' ','')} #deal"
-                },
-            }
-
-            for platform, data in copies.items():
-                copy_text = st.text_area(
-                    f"{platform}",
-                    value=data["copy"],
-                    height=120,
-                    key=f"copy_{platform}",
-                )
-                st.markdown(f'<div style="font-size:11px;color:{data["color"]};margin-top:-8px;margin-bottom:12px;">'
-                            f'✓ Optimised for {platform}</div>', unsafe_allow_html=True)
-
-            # ── Campaign strategy ──
-            st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-            st.markdown("### 🚀 AI Campaign Strategy")
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                st.markdown(f"""<div class="venus-card" style="text-align:center;">
-                    <div class="stat-label">Demand Score</div>
-                    <div class="stat-number">{int(demand_score*100)}%</div>
-                </div>""", unsafe_allow_html=True)
-            with c2:
-                st.markdown(f"""<div class="venus-card" style="text-align:center;">
-                    <div class="stat-label">Competitors Nearby</div>
-                    <div class="stat-number">{competitor_count}</div>
-                </div>""", unsafe_allow_html=True)
-            with c3:
-                st.markdown(f"""<div class="venus-card" style="text-align:center;">
-                    <div class="stat-label">Est. Reach (organic)</div>
-                    <div class="stat-number">{random.randint(800,8000):,}</div>
-                </div>""", unsafe_allow_html=True)
-
-            st.markdown(f"""
-            <div class="venus-card" style="margin-top:14px;">
-                <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
-                    <div>
-                        <div style="color:#00e5ff;font-weight:700;font-size:13px;margin-bottom:10px;">
-                            📱 Best Channels for {product}
-                        </div>
-                        <div style="font-size:13px;color:#b0bece;line-height:2.4;">
-                            {'🥇 TikTok — highest organic reach<br>🥈 Instagram Reels<br>🥉 WhatsApp Broadcast<br>4️⃣ Facebook Marketplace' if demand_score > 0.6 else
-                             '🥇 WhatsApp Broadcast<br>🥈 Facebook Groups<br>🥉 Instagram Stories<br>4️⃣ Word of mouth'}
-                        </div>
-                    </div>
-                    <div>
-                        <div style="color:#a855f7;font-weight:700;font-size:13px;margin-bottom:10px;">
-                            ⚡ Quick Wins
-                        </div>
-                        <div style="font-size:13px;color:#b0bece;line-height:2.4;">
-                            ⏳ Run a 24-hr flash sale<br>
-                            🤝 Partner with 2 micro-influencers<br>
-                            🏷️ Bundle with complementary item<br>
-                            📍 Target {user_location} geo ads
-                        </div>
-                    </div>
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-        else:
-            st.markdown("""
-            <div class="venus-card" style="text-align:center;padding:50px 40px;border-style:dashed;
-                border-color:rgba(0,229,255,0.12);">
-                <div style="font-size:40px;margin-bottom:14px;">🎨</div>
-                <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:700;color:#e8edf5;margin-bottom:8px;">
-                    Magazine Poster Studio
-                </div>
-                <div style="font-size:13px;color:#9aaabf;max-width:380px;margin:0 auto;line-height:1.7;">
-                    Customise your ad copy above then click
-                    <strong style="color:#00e5ff;">Generate Magazine Posters</strong> to create
-                    4 professional templates ready for social media.
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-# =========================================================
-# FRAUD DETECTION — Next Level
-# =========================================================
-elif "Fraud Detection" in menu:
-    import time, random, math
-
-    # ── Fraud CSS ──
-    st.markdown("""
-    <style>
-    .fraud-hero {
-        position: relative;
-        background: linear-gradient(135deg, rgba(255,75,110,0.08) 0%, rgba(0,0,0,0) 60%);
-        border: 1px solid rgba(255,75,110,0.15);
-        border-radius: 20px;
-        padding: 28px;
-        overflow: hidden;
-        margin-bottom: 20px;
-    }
-    .fraud-hero::before {
-        content: '🛡️';
-        position: absolute;
-        right: 20px; top: 10px;
-        font-size: 80px;
-        opacity: 0.07;
-    }
-    .threat-card {
-        background: rgba(255,75,110,0.06);
-        border: 1px solid rgba(255,75,110,0.18);
-        border-radius: 14px;
-        padding: 16px 18px;
-        margin-bottom: 10px;
-        position: relative;
-        overflow: hidden;
-        transition: border-color 0.2s;
-    }
-    .threat-card:hover { border-color: rgba(255,75,110,0.4); }
-    .threat-card::before {
-        content: '';
-        position: absolute;
-        left: 0; top: 0; bottom: 0;
-        width: 4px;
-        background: #ff4b6e;
-        border-radius: 4px 0 0 4px;
-    }
-    .medium-card {
-        background: rgba(255,184,0,0.05);
-        border: 1px solid rgba(255,184,0,0.18);
-        border-radius: 14px;
-        padding: 16px 18px;
-        margin-bottom: 10px;
-        position: relative;
-        overflow: hidden;
-    }
-    .medium-card::before {
-        content: '';
-        position: absolute;
-        left: 0; top: 0; bottom: 0;
-        width: 4px;
-        background: #ffb800;
-        border-radius: 4px 0 0 4px;
-    }
-    .safe-card {
-        background: rgba(0,224,150,0.04);
-        border: 1px solid rgba(0,224,150,0.15);
-        border-radius: 14px;
-        padding: 16px 18px;
-        margin-bottom: 10px;
-        position: relative;
-        overflow: hidden;
-    }
-    .safe-card::before {
-        content: '';
-        position: absolute;
-        left: 0; top: 0; bottom: 0;
-        width: 4px;
-        background: #00e096;
-        border-radius: 4px 0 0 4px;
-    }
-    .risk-meter-track {
-        height: 10px;
-        background: rgba(255,255,255,0.06);
-        border-radius: 6px;
-        overflow: hidden;
-        margin-top: 6px;
-    }
-    .scanner-line {
-        height: 2px;
-        background: linear-gradient(90deg, transparent, #ff4b6e, transparent);
-        animation: scan 2s linear infinite;
-        margin: 6px 0;
-    }
-    @keyframes scan {
-        0%   { margin-left: 0%;   width: 30%; }
-        50%  { margin-left: 35%;  width: 30%; }
-        100% { margin-left: 70%;  width: 30%; }
-    }
-    .module-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 5px 12px;
-        border-radius: 20px;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: 0.06em;
-        margin: 3px;
-    }
-    .mod-active {
-        background: rgba(0,229,255,0.1);
-        border: 1px solid rgba(0,229,255,0.25);
-        color: #00e5ff;
-    }
-    .anomaly-row {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 8px 0;
-        border-bottom: 1px solid rgba(255,255,255,0.04);
-    }
-    .anomaly-icon { font-size: 16px; flex-shrink: 0; }
-    .anomaly-name { font-size: 13px; font-weight: 600; color: #e8edf5; flex: 1; }
-    .anomaly-score { font-size: 13px; font-weight: 800; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    st.markdown("# 🛡️ Fraud Detection Engine")
-    st.markdown('<div class="section-label">Real-time multi-layer threat analysis · AI anomaly detection · Blockchain verification</div>', unsafe_allow_html=True)
-
-    conn2 = sqlite3.connect("venus_ai.db")
-    cursor2 = conn2.cursor()
-    if st.session_state.role == "Supplier":
-        cursor2.execute("SELECT product, price, qty, supplier, location FROM products WHERE user_id = ?", (user["id"],))
-    else:
-        cursor2.execute("SELECT product, price, qty, supplier, location FROM products")
-    rows = cursor2.fetchall()
-    conn2.close()
-
-    if not rows:
-        st.info("No inventory data available for analysis.")
-        st.stop()
-
-    df = pd.DataFrame(rows, columns=["product","price","qty","supplier","location"])
-
-    # ── SCAN animation ──
-    scan_ph = st.empty()
-    scan_ph.markdown("""
-    <div style="background:rgba(255,75,110,0.05);border:1px solid rgba(255,75,110,0.15);
-        border-radius:14px;padding:20px 24px;">
-        <div style="font-size:13px;font-weight:700;color:#ff4b6e;margin-bottom:10px;">
-            🔍 VENUS FRAUD ENGINE — SCANNING INVENTORY...
-        </div>
-        <div class="scanner-line"></div>
-        <div class="scanner-line" style="animation-delay:0.5s;"></div>
-        <div class="scanner-line" style="animation-delay:1s;"></div>
-        <div style="font-size:11px;color:#9aaabf;margin-top:8px;">
-            Checking price anomalies · Verifying supplier identities ·
-            Cross-referencing locations · Analysing transaction patterns
-        </div>
-    </div>""", unsafe_allow_html=True)
-    time.sleep(1.4)
-    scan_ph.empty()
-
-    # ── SCORING ENGINE ──
-    np.random.seed(42)
-    avg_price = df["price"].mean() or 1
-    med_price = df["price"].median() or 1
-
-    # Price anomaly — how far from median
-    df["price_anomaly"]   = (abs(df["price"] - med_price) / med_price).clip(0, 1)
-    # Stock anomaly
-    df["stock_anomaly"]   = df["qty"].apply(lambda x: 1.0 if x > 1000 else (0.7 if x < 1 else 0.0))
-    # Location risk
-    df["location_risk"]   = df["location"].apply(
-        lambda x: 0.8 if not str(x).strip() or "unknown" in str(x).lower() else 0.1)
-    # Supplier risk (duplicate supplier names raise flags)
-    supplier_counts = df["supplier"].value_counts()
-    df["supplier_risk"]   = df["supplier"].apply(
-        lambda x: 0.3 if supplier_counts.get(x, 0) > 3 else 0.0)
-    # Simulated behavioral signals
-    np.random.seed(abs(hash(str(df["product"].tolist()))) % 9999)
-    df["behavioral_risk"] = np.random.uniform(0, 0.6, len(df)).round(3)
-    df["velocity_risk"]   = np.random.uniform(0, 0.5, len(df)).round(3)
-
-    # Weighted fraud score
-    df["fraud_score"] = (
-        0.28 * df["price_anomaly"] +
-        0.22 * df["stock_anomaly"] +
-        0.18 * df["location_risk"] +
-        0.12 * df["supplier_risk"] +
-        0.12 * df["behavioral_risk"] +
-        0.08 * df["velocity_risk"]
-    ).round(3).clip(0, 1)
-
-    def risk_label(s):
-        if s > 0.65: return "HIGH RISK"
-        elif s > 0.35: return "MEDIUM RISK"
-        else: return "LOW RISK"
-
-    df["risk_level"] = df["fraud_score"].apply(risk_label)
-
-    high_df = df[df["risk_level"]=="HIGH RISK"]
-    med_df  = df[df["risk_level"]=="MEDIUM RISK"]
-    low_df  = df[df["risk_level"]=="LOW RISK"]
-    high_n, med_n, low_n = len(high_df), len(med_df), len(low_df)
-
-    overall_score = df["fraud_score"].mean()
-    system_status = "CRITICAL" if high_n > 2 else "ELEVATED" if high_n > 0 or med_n > 3 else "NOMINAL"
-    status_color  = "#ff4b6e" if system_status=="CRITICAL" else "#ffb800" if system_status=="ELEVATED" else "#00e096"
-
-    # ══════════════════════════════════
-    # HERO — System threat level
-    # ══════════════════════════════════
-    st.markdown(f"""
-    <div class="fraud-hero">
-        <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:16px;">
-            <div>
-                <div style="font-size:11px;font-weight:700;letter-spacing:.12em;
-                    text-transform:uppercase;color:#9aaabf;margin-bottom:8px;">
-                    THREAT LEVEL
-                </div>
-                <div style="font-family:'Syne',sans-serif;font-size:42px;font-weight:900;
-                    color:{status_color};line-height:1;letter-spacing:-1px;">
-                    {system_status}
-                </div>
-                <div style="font-size:13px;color:#b0bece;margin-top:8px;">
-                    Overall fraud risk index: <strong style="color:{status_color};">
-                    {int(overall_score*100)}/100</strong>
-                    &nbsp;·&nbsp; {len(df)} products analysed
-                </div>
-            </div>
-            <div style="text-align:right;">
-                <div style="font-size:11px;color:#9aaabf;margin-bottom:6px;">DETECTION MODULES</div>
-                <div>
-                    <span class="module-badge mod-active">💲 Price AI</span>
-                    <span class="module-badge mod-active">📦 Stock AI</span>
-                    <span class="module-badge mod-active">🌍 Location AI</span>
-                    <span class="module-badge mod-active">🤝 Supplier AI</span>
-                    <span class="module-badge mod-active">🧠 Behavioral AI</span>
-                    <span class="module-badge mod-active">⚡ Velocity AI</span>
-                </div>
-            </div>
-        </div>
-        <div style="margin-top:18px;">
-            <div style="font-size:11px;color:#9aaabf;margin-bottom:5px;">SYSTEM RISK METER</div>
-            <div class="risk-meter-track">
-                <div style="height:100%;width:{int(overall_score*100)}%;
-                    background:linear-gradient(90deg,#00e096,#ffb800,#ff4b6e);
-                    border-radius:6px;transition:width 1s ease;"></div>
-            </div>
-            <div style="display:flex;justify-content:space-between;font-size:10px;
-                color:#6a7a92;margin-top:4px;">
-                <span>SAFE</span><span>MODERATE</span><span>HIGH RISK</span>
-            </div>
-        </div>
-    </div>""", unsafe_allow_html=True)
-
-    # ══════════════════════════════════
-    # STAT CARDS ROW
-    # ══════════════════════════════════
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    stats = [
-        (c1, str(len(df)),    "Products",      "#b0bece", "rgba(255,255,255,0.07)"),
-        (c2, str(high_n),     "High Risk",     "#ff4b6e", "rgba(255,75,110,0.15)"),
-        (c3, str(med_n),      "Medium Risk",   "#ffb800", "rgba(255,184,0,0.12)"),
-        (c4, str(low_n),      "Low Risk",      "#00e096", "rgba(0,224,150,0.10)"),
-        (c5, f"{int(df['price_anomaly'].mean()*100)}%", "Price Anomaly", "#00e5ff", "rgba(0,229,255,0.08)"),
-        (c6, f"{int(df['behavioral_risk'].mean()*100)}%", "Behavior Risk", "#a855f7", "rgba(168,85,247,0.1)"),
-    ]
-    for col, val, lbl, vc, bg in stats:
-        with col:
-            st.markdown(f"""
-            <div style="background:{bg};border:1px solid {vc}30;border-radius:12px;
-                padding:14px 10px;text-align:center;">
-                <div style="font-family:'Syne',sans-serif;font-size:24px;font-weight:900;
-                    color:{vc};line-height:1;">{val}</div>
-                <div style="font-size:10px;color:#9aaabf;text-transform:uppercase;
-                    letter-spacing:.08em;margin-top:4px;">{lbl}</div>
-            </div>""", unsafe_allow_html=True)
-
-    st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-
-    # ══════════════════════════════════
-    # THREAT ALERTS — HIGH RISK
-    # ══════════════════════════════════
-    col_alerts, col_radar = st.columns([1.4, 1])
-
-    with col_alerts:
-        if not high_df.empty:
-            st.markdown(f"""
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;">
-                <div style="width:10px;height:10px;background:#ff4b6e;border-radius:50%;
-                    box-shadow:0 0 8px #ff4b6e;animation:pulse 1.5s infinite;"></div>
-                <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:800;color:#ff4b6e;">
-                    {high_n} ACTIVE THREAT{"S" if high_n>1 else ""} DETECTED
-                </div>
-            </div>
-            <style>@keyframes pulse {{
-                0%,100% {{ box-shadow:0 0 6px #ff4b6e; }}
-                50%      {{ box-shadow:0 0 16px #ff4b6e; }}
-            }}</style>""", unsafe_allow_html=True)
-
-            for _, row in high_df.iterrows():
-                # Determine which factors are spiking
-                flags = []
-                if row["price_anomaly"] > 0.4:   flags.append(f"💲 Price deviates {int(row['price_anomaly']*100)}% from market")
-                if row["stock_anomaly"] > 0.5:    flags.append("📦 Abnormal stock quantity")
-                if row["location_risk"] > 0.5:    flags.append("🌍 Location unverified")
-                if row["behavioral_risk"] > 0.4:  flags.append("🧠 Suspicious behavioral pattern")
-                if row["velocity_risk"] > 0.4:    flags.append("⚡ Unusual listing velocity")
-                if not flags:                     flags.append("🔍 Multiple low-level signals converging")
-
-                flags_html = "".join(
-                    f'<div style="font-size:11px;color:#ff8899;margin-top:3px;">⚠ {fl}</div>'
-                    for fl in flags
-                )
-                st.markdown(f"""
-                <div class="threat-card">
-                    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-                        <div style="flex:1;">
-                            <div style="font-size:14px;font-weight:800;color:#e8edf5;">
-                                {row['product']}
-                            </div>
-                            <div style="font-size:11px;color:#9aaabf;margin-top:2px;">
-                                {row.get('supplier','Unknown')} · {row.get('location','—')} ·
-                                ${row['price']:.2f} · Qty: {row['qty']}
-                            </div>
-                        </div>
-                        <div style="text-align:right;flex-shrink:0;margin-left:12px;">
-                            <div style="font-family:'Syne',sans-serif;font-size:22px;
-                                font-weight:900;color:#ff4b6e;">{int(row['fraud_score']*100)}</div>
-                            <div style="font-size:9px;color:#9aaabf;">RISK SCORE</div>
-                        </div>
-                    </div>
-                    <div style="margin-top:8px;">
-                        <div class="risk-meter-track">
-                            <div style="height:100%;width:{int(row['fraud_score']*100)}%;
-                                background:linear-gradient(90deg,#ffb800,#ff4b6e);border-radius:6px;">
-                            </div>
-                        </div>
-                    </div>
-                    <div style="margin-top:10px;">
-                        {flags_html}
-                    </div>
-                    <div style="margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,75,110,0.15);
-                        font-size:11px;color:#9aaabf;">
-                        <strong style="color:#ff4b6e;">Recommended:</strong>
-                        Pause listing · Verify supplier identity · Request proof of stock
-                    </div>
-                </div>""", unsafe_allow_html=True)
-
-        # MEDIUM RISK
-        if not med_df.empty:
-            st.markdown(f"""
-            <div style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;
-                color:#ffb800;margin:16px 0 10px;">
-                ⚠️ {med_n} MEDIUM RISK ITEM{"S" if med_n>1 else ""}
-            </div>""", unsafe_allow_html=True)
-
-            for _, row in med_df.iterrows():
-                flags = []
-                if row["price_anomaly"] > 0.25: flags.append(f"Price variance: {int(row['price_anomaly']*100)}%")
-                if row["behavioral_risk"] > 0.3: flags.append("Mild behavioral anomaly")
-                if row["velocity_risk"] > 0.3:   flags.append("Listing velocity above average")
-                flag_txt = " · ".join(flags) if flags else "Minor cross-signal anomaly"
-
-                st.markdown(f"""
-                <div class="medium-card">
-                    <div style="display:flex;justify-content:space-between;align-items:center;">
-                        <div>
-                            <div style="font-size:13px;font-weight:700;color:#e8edf5;">{row['product']}</div>
-                            <div style="font-size:11px;color:#9aaabf;margin-top:2px;">
-                                {row.get('supplier','—')} · ${row['price']:.2f}
-                            </div>
-                            <div style="font-size:11px;color:#ffb800;margin-top:4px;">⚡ {flag_txt}</div>
-                        </div>
-                        <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:900;
-                            color:#ffb800;">{int(row['fraud_score']*100)}</div>
-                    </div>
-                    <div class="risk-meter-track" style="margin-top:8px;">
-                        <div style="height:100%;width:{int(row['fraud_score']*100)}%;
-                            background:#ffb800;border-radius:6px;"></div>
-                    </div>
-                </div>""", unsafe_allow_html=True)
-
-        # SAFE
-        if not low_df.empty:
-            safe_chips = " ".join(
-                f'<span style="font-size:12px;color:#e8edf5;background:rgba(0,224,150,0.08);'
-                f'border:1px solid rgba(0,224,150,0.15);border-radius:8px;padding:4px 10px;">'
-                f'{r["product"]} <span style="color:#00e096;">✓</span></span>'
-                for _, r in low_df.iterrows()
-            )
-            st.markdown(f"""
-            <div style="margin-top:16px;">
-                <div style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;
-                    color:#00e096;margin-bottom:10px;">
-                    ✅ {low_n} VERIFIED SAFE
-                </div>
-                <div class="safe-card">
-                    <div style="display:flex;flex-wrap:wrap;gap:8px;">
-                        {safe_chips}
-                    </div>
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-    # ══════════════════════════════════
-    # RIGHT COL — Radar / Factor breakdown
-    # ══════════════════════════════════
-    with col_radar:
-        st.markdown("""
-        <div style="font-family:'Syne',sans-serif;font-size:14px;font-weight:700;
-            color:#e8edf5;margin-bottom:14px;">📊 Detection Factor Analysis</div>""", unsafe_allow_html=True)
-
-        factors = [
-            ("💲 Price Anomaly",    float(df["price_anomaly"].mean()),    "#ff4b6e"),
-            ("📦 Stock Risk",       float(df["stock_anomaly"].mean()),     "#ffb800"),
-            ("🌍 Location Risk",    float(df["location_risk"].mean()),     "#a855f7"),
-            ("🤝 Supplier Risk",    float(df["supplier_risk"].mean()),     "#00e5ff"),
-            ("🧠 Behavioral Risk",  float(df["behavioral_risk"].mean()),   "#ff4b6e"),
-            ("⚡ Velocity Risk",    float(df["velocity_risk"].mean()),     "#ffb800"),
-        ]
-
-        for label, val, color in factors:
-            pct = int(val * 100)
-            threat = "HIGH" if pct > 50 else "MED" if pct > 25 else "LOW"
-            tc = "#ff4b6e" if threat=="HIGH" else "#ffb800" if threat=="MED" else "#00e096"
-            st.markdown(f"""
-            <div style="margin-bottom:14px;">
-                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
-                    <span style="font-size:12px;color:#e8edf5;">{label}</span>
-                    <div style="display:flex;align-items:center;gap:8px;">
-                        <span style="font-size:10px;font-weight:700;padding:1px 7px;
-                            border-radius:10px;background:{tc}20;color:{tc};">{threat}</span>
-                        <span style="font-size:13px;font-weight:800;color:{color};">{pct}%</span>
-                    </div>
-                </div>
-                <div class="risk-meter-track">
-                    <div style="height:100%;width:{pct}%;background:{color};
-                        border-radius:6px;opacity:0.85;"></div>
-                </div>
-            </div>""", unsafe_allow_html=True)
-
-        # AI recommendation box
-        st.markdown('<div style="height:12px;"></div>', unsafe_allow_html=True)
-        if high_n > 0:
-            rec = f"Immediate action required on {high_n} listing(s). Suspend flagged products and request supplier verification documents before reinstating."
-            rec_c = "#ff4b6e"
-            rec_bg = "rgba(255,75,110,0.07)"
-            rec_border = "rgba(255,75,110,0.2)"
-        elif med_n > 0:
-            rec = f"{med_n} product(s) show moderate risk signals. Monitor closely over the next 48 hours and consider requesting additional supplier documentation."
-            rec_c = "#ffb800"
-            rec_bg = "rgba(255,184,0,0.06)"
-            rec_border = "rgba(255,184,0,0.2)"
-        else:
-            rec = "All products are within safe parameters. Your inventory shows strong trust signals. Continue routine monitoring."
-            rec_c = "#00e096"
-            rec_bg = "rgba(0,224,150,0.06)"
-            rec_border = "rgba(0,224,150,0.18)"
-
-        st.markdown(f"""
-        <div style="background:{rec_bg};border:1px solid {rec_border};border-radius:14px;padding:16px;">
-            <div style="font-size:11px;font-weight:700;letter-spacing:.08em;
-                text-transform:uppercase;color:{rec_c};margin-bottom:8px;">
-                🧠 AI Recommendation
-            </div>
-            <div style="font-size:13px;color:#e8edf5;line-height:1.7;">{rec}</div>
-        </div>""", unsafe_allow_html=True)
-
-    # ══════════════════════════════════
-    # FULL INVENTORY TABLE (expandable)
-    # ══════════════════════════════════
-    st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-    with st.expander("📋 Full Inventory Risk Table", expanded=False):
-        display_df = df[["product","price","qty","supplier","location",
-                          "fraud_score","price_anomaly","behavioral_risk","risk_level"]].copy()
-        display_df.columns = ["Product","Price","Qty","Supplier","Location",
-                               "Fraud Score","Price Anomaly","Behavior Risk","Risk Level"]
-        display_df["Fraud Score"]    = (display_df["Fraud Score"]*100).round(1).astype(str) + "%"
-        display_df["Price Anomaly"]  = (display_df["Price Anomaly"]*100).round(1).astype(str) + "%"
-        display_df["Behavior Risk"]  = (display_df["Behavior Risk"]*100).round(1).astype(str) + "%"
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-# =========================================================
-# VISION AI — Upgraded
-# =========================================================
-elif "Vision AI" in menu:
-    import base64, io, json, requests
-    from PIL import Image
-
-    # ── Custom CSS injected once ──────────────────────────────────────────────
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-
-    .vai-hero { padding: 0 0 36px 0; }
-    .vai-hero-badge {
-        display: inline-flex; align-items: center; gap: 6px;
-        background: rgba(99,153,34,0.12); border: 1px solid rgba(99,153,34,0.3);
-        color: #3B6D11; border-radius: 100px; font-size: 11px; font-weight: 600;
-        letter-spacing: 0.08em; padding: 4px 12px; margin-bottom: 14px;
-        text-transform: uppercase;
-    }
-    .vai-hero-title {
-        font-family: 'Syne', sans-serif; font-size: 32px; font-weight: 800;
-        line-height: 1.15; margin: 0 0 10px 0; letter-spacing: -0.02em;
-    }
-    .vai-hero-sub {
-        font-family: 'DM Sans', sans-serif; font-size: 15px; font-weight: 300;
-        color: var(--text-muted); line-height: 1.65; max-width: 540px;
-    }
-
-    .vai-capability-grid {
-        display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
-        margin: 28px 0 36px 0;
-    }
-    .vai-cap-card {
-        background: var(--background-secondary, #f8f8f8);
-        border: 1px solid rgba(128,128,128,0.15);
-        border-radius: 14px; padding: 18px 16px; position: relative; overflow: hidden;
-    }
-    .vai-cap-card::before {
-        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
-        border-radius: 14px 14px 0 0;
-    }
-    .vai-cap-card.green::before  { background: linear-gradient(90deg,#639922,#97C459); }
-    .vai-cap-card.amber::before  { background: linear-gradient(90deg,#BA7517,#EF9F27); }
-    .vai-cap-card.blue::before   { background: linear-gradient(90deg,#185FA5,#378ADD); }
-    .vai-cap-icon { font-size: 22px; margin-bottom: 10px; }
-    .vai-cap-title {
-        font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 700;
-        margin-bottom: 5px;
-    }
-    .vai-cap-desc {
-        font-size: 12px; line-height: 1.55; color: var(--text-muted);
-        font-family: 'DM Sans', sans-serif;
-    }
-
-    .vai-drop-zone {
-        border: 2px dashed rgba(128,128,128,0.25); border-radius: 20px;
-        background: linear-gradient(135deg, rgba(99,153,34,0.04) 0%, rgba(55,138,221,0.04) 100%);
-        padding: 60px 40px; text-align: center; transition: all 0.2s;
-    }
-    .vai-drop-icon { font-size: 48px; margin-bottom: 18px; line-height: 1; }
-    .vai-drop-title {
-        font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 700;
-        margin-bottom: 8px;
-    }
-    .vai-drop-sub { font-size: 13px; color: var(--text-muted); margin-bottom: 6px; }
-    .vai-drop-formats {
-        display: inline-flex; gap: 8px; margin-top: 10px;
-    }
-    .vai-format-pill {
-        background: rgba(128,128,128,0.1); border-radius: 100px;
-        font-size: 11px; font-weight: 600; padding: 3px 10px;
-        letter-spacing: 0.06em; color: var(--text-muted);
-    }
-
-    .vai-verdict-card {
-        border-radius: 18px; padding: 28px; margin-bottom: 18px;
-        border: 1.5px solid;
-    }
-    .vai-verdict-label {
-        font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
-        text-transform: uppercase; margin-bottom: 6px;
-    }
-    .vai-verdict-main {
-        font-family: 'Syne', sans-serif; font-size: 28px; font-weight: 800;
-        margin-bottom: 4px; line-height: 1.1;
-    }
-    .vai-verdict-sub { font-size: 13px; color: var(--text-muted); line-height: 1.5; }
-
-    .vai-metric-row { display: flex; gap: 10px; margin: 16px 0; flex-wrap: wrap; }
-    .vai-metric {
-        flex: 1; min-width: 80px; background: rgba(128,128,128,0.07);
-        border-radius: 12px; padding: 12px 14px; text-align: center;
-    }
-    .vai-metric-val {
-        font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 700; line-height: 1;
-    }
-    .vai-metric-lbl { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
-
-    .vai-flag {
-        display: flex; align-items: flex-start; gap: 10px;
-        background: rgba(186,117,23,0.08); border-left: 3px solid #BA7517;
-        border-radius: 0 10px 10px 0; padding: 10px 14px; margin: 8px 0;
-        font-size: 13px; line-height: 1.5;
-    }
-    .vai-flag-ok {
-        display: flex; align-items: flex-start; gap: 10px;
-        background: rgba(99,153,34,0.08); border-left: 3px solid #639922;
-        border-radius: 0 10px 10px 0; padding: 10px 14px; margin: 8px 0;
-        font-size: 13px; line-height: 1.5;
-    }
-    .vai-ai-section {
-        background: rgba(55,138,221,0.06); border: 1px solid rgba(55,138,221,0.2);
-        border-radius: 14px; padding: 18px; margin-top: 16px;
-    }
-    .vai-ai-label {
-        font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
-        text-transform: uppercase; color: #185FA5; margin-bottom: 10px;
-    }
-    .vai-ai-text { font-size: 13px; line-height: 1.65; color: var(--text-secondary); }
-
-    .vai-score-ring-wrap { text-align: center; padding: 20px 0 8px; }
-    .vai-score-num {
-        font-family: 'Syne', sans-serif; font-size: 56px; font-weight: 800;
-        line-height: 1; letter-spacing: -0.03em;
-    }
-    .vai-score-lbl { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # ── Hero ──────────────────────────────────────────────────────────────────
-    st.markdown("""
-    <div class="vai-hero">
-        <div class="vai-hero-badge">🔬 Vision AI</div>
-        <div class="vai-hero-title">Is your product image<br>working <em>for</em> or <em>against</em> you?</div>
-        <div class="vai-hero-sub">
-            Upload any product photo. Vision AI detects AI-generated fakes, 
-            reverse-searches for plagiarism signals, scores image quality, 
-            and tells you exactly what it means for your sales conversions.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Capability cards ──────────────────────────────────────────────────────
-    st.markdown("""
-    <div class="vai-capability-grid">
-        <div class="vai-cap-card green">
-            <div class="vai-cap-icon">🧠</div>
-            <div class="vai-cap-title">AI Fake Detection</div>
-            <div class="vai-cap-desc">Flags synthetic textures, impossible lighting, and artifacts left by Midjourney, DALL·E, and Stable Diffusion.</div>
-        </div>
-        <div class="vai-cap-card amber">
-            <div class="vai-cap-icon">🔍</div>
-            <div class="vai-cap-title">Plagiarism Signals</div>
-            <div class="vai-cap-desc">Detects stock photo fingerprints, watermark remnants, and signals suggesting the image wasn't originally yours.</div>
-        </div>
-        <div class="vai-cap-card blue">
-            <div class="vai-cap-icon">📈</div>
-            <div class="vai-cap-title">Conversion Impact</div>
-            <div class="vai-cap-desc">Translates every technical finding into a plain-language revenue impact — so you know what actually needs fixing.</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── File uploader ─────────────────────────────────────────────────────────
-    file = st.file_uploader(
-        "Upload a product image",
-        type=["jpg", "png", "jpeg"],
-        key="vision_upload",
-        label_visibility="collapsed"
-    )
-
-    # ── Empty state ───────────────────────────────────────────────────────────
-    if not file:
-        st.markdown("""
-        <div class="vai-drop-zone">
-            <div class="vai-drop-icon">🖼️</div>
-            <div class="vai-drop-title">Drop your product image here</div>
-            <div class="vai-drop-sub">We'll scan it for AI generation, plagiarism risk, and quality issues in seconds.</div>
-            <div class="vai-drop-formats">
-                <span class="vai-format-pill">JPG</span>
-                <span class="vai-format-pill">PNG</span>
-                <span class="vai-format-pill">JPEG</span>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        with st.expander("💡 What makes a product image trustworthy?"):
-            st.markdown("""
-            Buyers make snap judgments in under 200ms. Your image signals authenticity before a single word is read.
-
-            **Red flags that kill conversions:**
-            - Obvious AI-generation artifacts (melting edges, impossible reflections)
-            - Watermarked or heavily filtered stock photos
-            - Flat, shadowless lighting that looks "too clean"
-            - Off-brand colour grading inconsistent with other listings
-
-            **What Vision AI checks:**
-            1. Pixel-level texture and noise patterns (AI images are unnaturally smooth)
-            2. Lighting consistency (synthetic images often have impossible light sources)
-            3. Colour channel distribution (stock photos share recognizable fingerprints)
-            4. Edge sharpness and compression artefact profiles
-            5. Claude's own multimodal understanding of the full scene
-            """)
-
-    # ── Analysis ──────────────────────────────────────────────────────────────
-    else:
-        image = Image.open(file).convert("RGB")
-        img_array = np.array(image)
-
-        # — Pixel-level metrics —
-        brightness   = float(img_array.mean())
-        contrast     = float(img_array.std())
-        red_mean     = float(img_array[:, :, 0].mean())
-        green_mean   = float(img_array[:, :, 1].mean())
-        blue_mean    = float(img_array[:, :, 2].mean())
-        color_var    = float(np.std([red_mean, green_mean, blue_mean]))
-        texture      = float(np.mean(np.abs(np.diff(img_array, axis=0))))
-
-        # Noise analysis (high-frequency content ratio)
-        from scipy import ndimage
-        blurred      = ndimage.gaussian_filter(img_array.astype(float), sigma=2)
-        noise_energy = float(np.mean(np.abs(img_array.astype(float) - blurred)))
-
-        # Edge density
-        gray         = np.mean(img_array, axis=2)
-        diff_y = np.abs(np.diff(gray, axis=0))   # shape: (H-1, W)
-        diff_x = np.abs(np.diff(gray, axis=1))   # shape: (H,   W-1)
- 
-        # Crop both to the overlapping region (H-1, W-1) so shapes match
-        edges = diff_y[:, :-1] + diff_x[:-1, :]
-        edge_density = float(np.mean(edges > 15))
-
-        # — Rule-based risk scoring —
-        risk_score = 0
-        flags = []
-
-        if brightness < 60 or brightness > 215:
-            risk_score += 15
-            flags.append(("lighting", "Extreme brightness — suggests artificial or heavily edited lighting"))
-
-        if contrast < 25:
-            risk_score += 20
-            flags.append(("contrast", "Very low contrast — hallmark of AI-generated or heavily smoothed images"))
-
-        if color_var < 6:
-            risk_score += 20
-            flags.append(("color", "Unnaturally uniform colour channels — common in AI-generated images"))
-
-        if texture < 8:
-            risk_score += 20
-            flags.append(("texture", "Low texture complexity — may indicate AI generation or heavy post-processing"))
-
-        if noise_energy < 3.0:
-            risk_score += 15
-            flags.append(("noise", "Near-zero noise signature — real photographs always contain sensor noise"))
-
-        if edge_density < 0.04:
-            risk_score += 10
-            flags.append(("edges", "Sparse edge detail — possible over-smoothing or stock/composite image"))
-
-        authenticity = max(0, 100 - risk_score)
-
-        # — Encode image for Claude API —
-        buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=85)
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-
-        # — Build pixel summary for Claude —
-        pixel_summary = f"""
-Pixel-level analysis:
-- Brightness: {brightness:.1f}/255
-- Contrast (std dev): {contrast:.1f}
-- Colour channel variation (R/G/B spread): {color_var:.2f}
-- Texture score: {texture:.2f}
-- Noise energy: {noise_energy:.2f}
-- Edge density: {edge_density:.3f}
-- Rule-based authenticity score: {authenticity}%
-- Flagged issues: {[f[1] for f in flags] if flags else "none"}
-        """.strip()
-
-        # — Call Claude API —
-        with st.spinner("🔬 Running deep image analysis with Vision AI..."):
-            try:
-                api_response = requests.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "model": "claude-sonnet-4-20250514",
-                        "max_tokens": 1000,
-                        "messages": [{
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": "image/jpeg",
-                                        "data": img_b64
-                                    }
-                                },
-                                {
-                                    "type": "text",
-                                    "text": f"""You are Vision AI, an expert in product image authenticity for e-commerce.
-
-Analyse this product image across three dimensions and respond ONLY as valid JSON — no markdown, no extra text.
-
-Pixel-level metrics for context:
-{pixel_summary}
-
-Return exactly this JSON structure:
-{{
-  "ai_verdict": {{
-    "is_likely_ai": true/false,
-    "confidence": "high"/"medium"/"low",
-    "reasoning": "1-2 sentence explanation of visual evidence for or against AI generation"
-  }},
-  "plagiarism_signals": {{
-    "risk_level": "high"/"medium"/"low"/"none",
-    "signals_found": ["list of up to 3 specific visual signals, or empty array"],
-    "reasoning": "1-2 sentence explanation"
-  }},
-  "quality_assessment": {{
-    "overall_grade": "A"/"B"/"C"/"D"/"F",
-    "strengths": ["up to 2 genuine strengths"],
-    "weaknesses": ["up to 2 genuine weaknesses"],
-    "conversion_impact": "1-2 sentence plain-English business impact"
-  }},
-  "recommendation": "One actionable sentence: what should the seller do next?"
-}}"""
-                                }
-                            ]
-                        }]
-                    },
-                    timeout=30
-                )
-                raw = api_response.json()["content"][0]["text"]
-                clean = raw.replace("```json", "").replace("```", "").strip()
-                ai_data = json.loads(clean)
-            except Exception as e:
-                ai_data = None
-
-        # ── Layout ────────────────────────────────────────────────────────────
-        col_img, col_res = st.columns([1, 1.3])
-
-        with col_img:
-            st.image(image, caption="Uploaded image", use_container_width=True)
-
-            # Quick metrics under image
-            st.markdown(f"""
-            <div class="vai-metric-row">
-                <div class="vai-metric">
-                    <div class="vai-metric-val">{brightness:.0f}</div>
-                    <div class="vai-metric-lbl">Brightness</div>
-                </div>
-                <div class="vai-metric">
-                    <div class="vai-metric-val">{contrast:.0f}</div>
-                    <div class="vai-metric-lbl">Contrast</div>
-                </div>
-                <div class="vai-metric">
-                    <div class="vai-metric-val">{texture:.1f}</div>
-                    <div class="vai-metric-lbl">Texture</div>
-                </div>
-                <div class="vai-metric">
-                    <div class="vai-metric-val">{noise_energy:.1f}</div>
-                    <div class="vai-metric-lbl">Noise</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with col_res:
-            # — Authenticity score card —
-            if authenticity >= 75:
-                score_color = "#639922"
-                score_bg    = "rgba(99,153,34,0.08)"
-                score_bdr   = "rgba(99,153,34,0.3)"
-                score_label = "Likely Authentic"
-            elif authenticity >= 45:
-                score_color = "#BA7517"
-                score_bg    = "rgba(186,117,23,0.08)"
-                score_bdr   = "rgba(186,117,23,0.3)"
-                score_label = "Suspicious — Review Needed"
-            else:
-                score_color = "#A32D2D"
-                score_bg    = "rgba(163,45,45,0.08)"
-                score_bdr   = "rgba(163,45,45,0.3)"
-                score_label = "High Risk — Likely Fake or Plagiarised"
-
-            st.markdown(f"""
-            <div class="vai-verdict-card" style="background:{score_bg};border-color:{score_bdr};">
-                <div class="vai-verdict-label" style="color:{score_color};">Authenticity Score</div>
-                <div class="vai-score-ring-wrap">
-                    <div class="vai-score-num" style="color:{score_color};">{authenticity}%</div>
-                    <div class="vai-score-lbl">{score_label}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            # — Pixel flags —
-            if flags:
-                st.markdown("**Technical flags detected:**")
-                for _, msg in flags:
-                    st.markdown(f'<div class="vai-flag">⚠️ &nbsp;{msg}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown('<div class="vai-flag-ok">✅ &nbsp;No pixel-level anomalies detected</div>', unsafe_allow_html=True)
-
-            # — Claude AI analysis —
-            if ai_data:
-                ai_v   = ai_data.get("ai_verdict", {})
-                plag_v = ai_data.get("plagiarism_signals", {})
-                qual_v = ai_data.get("quality_assessment", {})
-                reco   = ai_data.get("recommendation", "")
-
-                # AI verdict
-                ai_icon  = "🤖" if ai_v.get("is_likely_ai") else "📷"
-                ai_label = "AI-Generated" if ai_v.get("is_likely_ai") else "Appears Human-Taken"
-                ai_conf  = ai_v.get("confidence", "").capitalize()
-                st.markdown(f"""
-                <div class="vai-ai-section">
-                    <div class="vai-ai-label">🧠 Claude's Deep Analysis</div>
-                    <div style="display:flex;gap:12px;align-items:flex-start;margin-bottom:14px;">
-                        <div style="font-size:28px;line-height:1;">{ai_icon}</div>
-                        <div>
-                            <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:700;">{ai_label} <span style="font-size:11px;font-weight:400;color:var(--text-muted);">({ai_conf} confidence)</span></div>
-                            <div class="vai-ai-text">{ai_v.get("reasoning", "")}</div>
-                        </div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # Plagiarism
-                p_risk = plag_v.get("risk_level", "none")
-                p_map  = {"high": ("🚨", "#A32D2D"), "medium": ("⚠️", "#BA7517"),
-                          "low": ("🔶", "#BA7517"), "none": ("✅", "#639922")}
-                p_ico, p_col = p_map.get(p_risk, p_map["none"])
-                p_signals = plag_v.get("signals_found", [])
-
-                st.markdown(f"""
-                <div style="margin-top:14px;">
-                    <div style="font-size:12px;font-weight:700;letter-spacing:0.07em;text-transform:uppercase;
-                        color:{p_col};margin-bottom:6px;">🔍 Plagiarism Risk — {p_risk.upper()}</div>
-                    <div class="vai-ai-text">{plag_v.get("reasoning","")}</div>
-                    {"".join(f'<div class="vai-flag">{p_ico}&nbsp;{s}</div>' for s in p_signals) if p_signals else '<div class="vai-flag-ok">✅ &nbsp;No stock photo or plagiarism signals detected</div>'}
-                </div>
-                """, unsafe_allow_html=True)
-
-                # Quality grade
-                grade   = qual_v.get("overall_grade", "?")
-                g_color = {"A":"#639922","B":"#3B6D11","C":"#BA7517","D":"#A32D2D","F":"#791F1F"}.get(grade, "#888")
-                strengths  = qual_v.get("strengths", [])
-                weaknesses = qual_v.get("weaknesses", [])
-
-                st.markdown(f"""
-                <div style="margin-top:16px;display:flex;gap:16px;align-items:flex-start;">
-                    <div style="background:rgba(128,128,128,0.08);border-radius:12px;padding:12px 18px;text-align:center;min-width:64px;">
-                        <div style="font-family:'Syne',sans-serif;font-size:36px;font-weight:800;color:{g_color};line-height:1;">{grade}</div>
-                        <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">Quality</div>
-                    </div>
-                    <div style="flex:1;">
-                        {"".join(f'<div class="vai-flag-ok">✅ &nbsp;{s}</div>' for s in strengths)}
-                        {"".join(f'<div class="vai-flag">⚠️ &nbsp;{w}</div>' for w in weaknesses)}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                # Business impact + recommendation
-                st.markdown(f"""
-                <div style="margin-top:18px;background:rgba(128,128,128,0.06);border-radius:12px;padding:16px;">
-                    <div style="font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;
-                        color:var(--text-muted);margin-bottom:8px;">📈 Business Impact</div>
-                    <div class="vai-ai-text">{qual_v.get("conversion_impact","")}</div>
-                    {"" if not reco else f'<div style="margin-top:10px;font-size:13px;font-weight:600;color:var(--text-primary);">→ {reco}</div>'}
-                </div>
-                """, unsafe_allow_html=True)
-
-            else:
-                # Fallback if API fails — still show rule-based impact
-                if authenticity < 50:
-                    st.error("⚠️ High-risk image. Likely to reduce buyer trust and hurt conversion rates. Consider replacing before listing.")
-                elif authenticity < 75:
-                    st.warning("🔶 Moderate concern. Improving image quality could meaningfully boost conversions.")
-                else:
-                    st.success("✅ Image quality looks solid — supports buyer confidence.")
-# =========================================================
-# BLOCKCHAIN
-# =========================================================
-elif "Blockchain" in menu:
-    import hashlib
-
-    st.markdown("# Blockchain Verification")
-    st.markdown('<div class="section-label">Immutable product record ledger</div>', unsafe_allow_html=True)
-
-    if "blockchain" not in st.session_state:
-        st.session_state.blockchain = []
-    if "supplier_scores" not in st.session_state:
-        st.session_state.supplier_scores = {}
-
-    col_info, col_action = st.columns([1, 1.4])
-
-    with col_info:
-        st.markdown("""
-        <div class="venus-card">
-            <div style="font-size:13px;font-weight:600;color:var(--accent-cyan);margin-bottom:12px;">Why Blockchain?</div>
-            <div style="font-size:13px;color:var(--text-dim);line-height:2.2;">
-                🔒 Records cannot be altered once added<br>
-                📋 Supplier actions are permanently logged<br>
-                🔍 Tampering is detected instantly<br>
-                🤝 Trust layer across the entire system
-            </div>
-        </div>""", unsafe_allow_html=True)
-
-    conn2 = sqlite3.connect("venus_ai.db")
-    cursor2 = conn2.cursor()
-    cursor2.execute("SELECT product, price, qty, supplier, location FROM products")
-    rows = cursor2.fetchall()
-    conn2.close()
-
-    if rows:
-        df = pd.DataFrame(rows, columns=["product","price","qty","supplier","location"])
-
-        with col_action:
-            product = st.selectbox("Select Product to Record", df["product"], key="bc_prod")
-            item = df[df["product"] == product].iloc[0]
-
-            col_b1, col_b2 = st.columns(2)
-            with col_b1:
-                if st.button("🧱 Add to Blockchain", key="bc_add_btn", use_container_width=True):
-                    timestamp = str(datetime.datetime.now())
-                    data_str = f"{item['product']}{item['price']}{item['qty']}{item['supplier']}{item['location']}{timestamp}"
-                    hash_val = hashlib.sha256(data_str.encode()).hexdigest()
-                    prev_hash = st.session_state.blockchain[-1]["hash"] if st.session_state.blockchain else "GENESIS"
-                    block = {"product":item["product"],"price":item["price"],"qty":item["qty"],
-                             "supplier":item["supplier"],"location":item["location"],
-                             "time":timestamp,"hash":hash_val,"previous_hash":prev_hash}
-                    st.session_state.blockchain.append(block)
-                    if item["supplier"] not in st.session_state.supplier_scores:
-                        st.session_state.supplier_scores[item["supplier"]] = 100
-                    st.success("✅ Block added to chain!")
-
-            with col_b2:
-                if st.button("🔍 Verify Chain", key="bc_verify_btn", use_container_width=True):
-                    valid = all(
-                        st.session_state.blockchain[i]["previous_hash"] == st.session_state.blockchain[i-1]["hash"]
-                        for i in range(1, len(st.session_state.blockchain))
-                    )
-                    if valid:
-                        st.success("✅ Chain integrity verified")
-                    else:
-                        st.error("❌ Tampering detected!")
-                        for block in st.session_state.blockchain:
-                            sup = block["supplier"]
-                            st.session_state.supplier_scores[sup] = st.session_state.supplier_scores.get(sup, 100) - 10
-
-            st.checkbox("⚡ Auto-record on selection", key="bc_auto")
-            if st.session_state.get("bc_auto"):
-                timestamp = str(datetime.datetime.now())
-                data_str = f"{item['product']}{item['price']}{item['qty']}{item['supplier']}{item['location']}{timestamp}"
-                hash_val = hashlib.sha256(data_str.encode()).hexdigest()
-                prev_hash = st.session_state.blockchain[-1]["hash"] if st.session_state.blockchain else "GENESIS"
-                block = {"product":item["product"],"price":item["price"],"qty":item["qty"],
-                         "supplier":item["supplier"],"location":item["location"],
-                         "time":timestamp,"hash":hash_val,"previous_hash":prev_hash}
-                st.session_state.blockchain.append(block)
-
-            if st.button("💣 Simulate Tampering", key="bc_tamper"):
-                if st.session_state.blockchain:
-                    st.session_state.blockchain[0]["price"] = 999999
-                    st.warning("⚠️ Block 0 has been tampered with!")
-
-        st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-
-        col_ledger, col_trust = st.columns([1.5, 1])
-
-        with col_ledger:
-            if st.session_state.blockchain:
-                st.markdown("### 📜 Blockchain Ledger")
-                for block in reversed(st.session_state.blockchain[-5:]):
-                    st.markdown(f"""
-                    <div class="venus-card" style="font-size:12px;padding:14px;font-family:monospace;color:var(--text-dim);">
-                        <div style="color:var(--accent-cyan);font-weight:700;margin-bottom:6px;">📦 {block['product']}</div>
-                        <div>Price: {block['price']} | Qty: {block['qty']}</div>
-                        <div>Supplier: {block['supplier']} | {block['location']}</div>
-                        <div style="margin-top:6px;word-break:break-all;">Hash: {block['hash'][:40]}...</div>
-                        <div style="color:var(--text-muted);">Prev: {block['previous_hash'][:30]}...</div>
-                        <div style="margin-top:4px;">{block['time']}</div>
-                    </div>""", unsafe_allow_html=True)
-            else:
-                st.info("No blocks recorded yet.")
-
-        with col_trust:
-            if st.session_state.supplier_scores:
-                st.markdown("### 🧠 Supplier Trust")
-                for supplier, score in st.session_state.supplier_scores.items():
-                    color = "var(--success)" if score > 80 else ("var(--warning)" if score > 50 else "var(--danger)")
-                    label = "Highly Trusted" if score > 80 else ("Moderate" if score > 50 else "High Risk")
-                    st.markdown(f"""
-                    <div class="venus-card" style="padding:14px;border-color:{color}30;">
-                        <div style="font-size:13px;font-weight:600;color:var(--text-primary);">{supplier}</div>
-                        <div style="color:{color};font-size:20px;font-weight:800;margin:4px 0;">{score}</div>
-                        <div style="font-size:11px;color:var(--text-muted);">{label}</div>
-                    </div>""", unsafe_allow_html=True)
-    else:
-        st.info("No inventory data available for blockchain recording.")
 # =========================================================
 # SUPPLIER INBOX & PRODUCTS — Fixed image_url column error
 # =========================================================
