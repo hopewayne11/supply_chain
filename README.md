@@ -21,6 +21,7 @@ The system combines machine learning, computer vision, and intelligent analytics
 - Support product quality assessment
 
 ### Demand Forecasting
+- Real time prediction with live data (google trends, social media signals, datasets).
 - Predict future product demand
 - Identify potential stock shortages
 - Assist inventory planning
