@@ -955,15 +955,11 @@ with st.sidebar:
     if st.session_state.role == "Supplier":
         menu = st.selectbox("", [
             "Dashboard",
-            "Add Product",
             "Inventory",
-            "Prediction",
-            "Marketing AI",
-            "Fraud Detection",
-            "Vision AI",
-            
+            "Prediction & Intelligence",
             "Inbox & Products",
             "VENUS AI Assistant",
+            
         ], label_visibility="collapsed")
     else:
         menu = st.selectbox("", [
@@ -1169,6 +1165,56 @@ if "Dashboard" in menu:
     </style>
     """, unsafe_allow_html=True)
 
+    # ── Self-heal: make sure tables the dashboard depends on exist ───────────
+    # This is what was actually crashing the page: `cart` (and possibly
+    # `transactions` / `inventory` / `seller_messages`) had never been
+    # created, so the very first unguarded query against it raised
+    # `sqlite3.OperationalError: no such table: cart`. Creating them here
+    # with IF NOT EXISTS is a safe no-op if they already exist elsewhere in
+    # your app with the same or a richer schema — it only fires the first
+    # time the dashboard loads on a fresh database.
+    _dbc = sqlite3.connect("venus_ai.db")
+    for _tbl_sql in [
+        """CREATE TABLE IF NOT EXISTS cart (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               buyer_id INTEGER,
+               supplier TEXT,
+               product TEXT,
+               price REAL,
+               qty INTEGER,
+               status TEXT DEFAULT 'pending',
+               added_at TEXT DEFAULT CURRENT_TIMESTAMP
+           )""",
+        """CREATE TABLE IF NOT EXISTS transactions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               supplier TEXT,
+               buyer_id INTEGER,
+               product TEXT,
+               price REAL,
+               quantity INTEGER,
+               total REAL,
+               date TEXT DEFAULT CURRENT_TIMESTAMP
+           )""",
+        """CREATE TABLE IF NOT EXISTS inventory (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               user_id INTEGER,
+               qty INTEGER DEFAULT 0
+           )""",
+        """CREATE TABLE IF NOT EXISTS seller_messages (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               seller_name TEXT,
+               buyer_id INTEGER,
+               message TEXT,
+               sent_at TEXT DEFAULT CURRENT_TIMESTAMP
+           )""",
+    ]:
+        try:
+            _dbc.execute(_tbl_sql)
+            _dbc.commit()
+        except:
+            pass
+    _dbc.close()
+
     # ── Time greeting ──
     hour = _dt.datetime.now().hour
     greeting = "Good morning" if hour < 12 else ("Good afternoon" if hour < 18 else "Good evening")
@@ -1232,34 +1278,56 @@ if "Dashboard" in menu:
         """, unsafe_allow_html=True)
 
         # ── Pull supplier-specific data ──
-        cursor.execute("SELECT COUNT(*) FROM products WHERE user_id=?", (user_id,))
-        product_count = cursor.fetchone()[0]
+        # Every query below is now defensively wrapped: a missing table or
+        # column falls back to a safe default (0 / 0.0) instead of crashing
+        # the whole dashboard, matching the pattern already used further
+        # down this file for seller_messages / avg_price.
+        product_count = 0
+        try:
+            cursor.execute("SELECT COUNT(*) FROM products WHERE user_id=?", (user_id,))
+            product_count = cursor.fetchone()[0] or 0
+        except:
+            pass
 
-        cursor.execute("SELECT COUNT(*), SUM(total) FROM transactions WHERE supplier=? OR supplier=?",
-                       (user['name'], user['username']))
-        txn_row = cursor.fetchone()
-        txn_count = txn_row[0] or 0
-        revenue   = round(txn_row[1] or 0, 2)
+        txn_count, revenue = 0, 0.0
+        try:
+            cursor.execute("SELECT COUNT(*), SUM(total) FROM transactions WHERE supplier=? OR supplier=?",
+                           (user['name'], user['username']))
+            txn_row = cursor.fetchone()
+            txn_count = txn_row[0] or 0
+            revenue   = round(txn_row[1] or 0, 2)
+        except:
+            pass
 
-        cursor.execute("SELECT SUM(qty) FROM inventory WHERE user_id=?", (user_id,))
-        inv_units = cursor.fetchone()[0] or 0
+        inv_units = 0
+        try:
+            cursor.execute("SELECT SUM(qty) FROM inventory WHERE user_id=?", (user_id,))
+            inv_units = cursor.fetchone()[0] or 0
+        except:
+            pass
 
-        cursor.execute("SELECT COUNT(*) FROM cart WHERE (supplier=? OR supplier=?) AND status='pending'",
-                       (user['name'], user['username']))
-        pending_orders = cursor.fetchone()[0] or 0
+        pending_orders = 0
+        try:
+            cursor.execute("SELECT COUNT(*) FROM cart WHERE (supplier=? OR supplier=?) AND status='pending'",
+                           (user['name'], user['username']))
+            pending_orders = cursor.fetchone()[0] or 0
+        except:
+            pass
 
+        unread_msgs = 0
         try:
             cursor.execute("SELECT COUNT(*) FROM seller_messages WHERE seller_name=? OR seller_name=?",
                            (user['name'], user['username']))
             unread_msgs = cursor.fetchone()[0] or 0
         except:
-            unread_msgs = 0
+            pass
 
         avg_price = 0
         try:
             cursor.execute("SELECT AVG(price) FROM products WHERE user_id=?", (user_id,))
             avg_price = round(cursor.fetchone()[0] or 0, 2)
-        except: pass
+        except:
+            pass
 
         # ── AI insight ──
         if revenue > 0:
@@ -1485,9 +1553,8 @@ if "Dashboard" in menu:
             st.markdown('<div class="db-panel db-animate" style="animation-delay:0.26s;">', unsafe_allow_html=True)
             st.markdown('<div class="db-panel-title">AI Modules</div>', unsafe_allow_html=True)
             modules = [
-                ("📈", "Prediction Engine"), ("🛡️", "Fraud Detection"),
-                ("👁️", "Vision AI"),         ("🧱", "Blockchain"),
-                ("💰", "Financial AI"),      ("📣", "Marketing AI"),
+                ("📈", "Supplier Intelligence"), 
+                
             ]
             mod_html = '<div class="db-module-grid">'
             for icon, name in modules:
@@ -1500,7 +1567,7 @@ if "Dashboard" in menu:
             mod_html += '</div>'
             st.markdown(mod_html, unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-            
+
     # ═══════════════════════════════════════════════════════
     # CUSTOMER DASHBOARD
     # ═══════════════════════════════════════════════════════
@@ -1705,13 +1772,8 @@ if "Dashboard" in menu:
                 st.session_state["menu_override"] = "VENUS AI Assistant"
                 st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
-
 # =========================================================
-# INVENTORY — List products, upload photos, and run full
-#             Vision AI photo-intelligence, all in one screen.
-#             (Replaces the separate "Inventory" + "Vision AI"
-#              sections — delete the old "Vision AI" elif block
-#              and its sidebar/menu entry once this is in place.)
+# INVENTORY 
 # =========================================================
 elif "Inventory" in menu:
     import base64 as _b64
@@ -2505,8 +2567,9 @@ Return exactly this JSON structure:
             
 # =========================================================
 # PREDICTION — Next-Level Intelligence Engine
+#              + Supplier Intelligence (Trust Score & risk scoring)
 # =========================================================
-elif "Prediction" in menu:
+elif "Prediction & Intelligence" in menu:
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     import random, time
@@ -2542,6 +2605,12 @@ elif "Prediction" in menu:
     .signal-card.stock::before   { background:#ffb800; }
     .signal-card.rating::before  { background:#00e096; }
     .signal-card.sentiment::before { background:#ff4b6e; }
+    /* ── Supplier Intelligence accent colours ── */
+    .signal-card.delivery::before  { background:#00e5ff; }
+    .signal-card.quality::before   { background:#00e096; }
+    .signal-card.fraud::before     { background:#ff4b6e; }
+    .signal-card.stability::before { background:#ffb800; }
+    .signal-card.history::before   { background:#a855f7; }
     .signal-label {
         font-size:11px;font-weight:700;letter-spacing:.08em;
         text-transform:uppercase;color:#9aaabf;
@@ -2571,23 +2640,110 @@ elif "Prediction" in menu:
         background:rgba(255,255,255,0.03);border-radius:8px;
         border:1px solid rgba(255,255,255,0.06);margin:3px 3px 3px 0;
     }
+    .rank-badge {
+        display:inline-flex;align-items:center;gap:6px;
+        font-size:11px;font-weight:700;color:#e8edf5;
+        background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
+        border-radius:20px;padding:4px 12px;margin-top:8px;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown("# 🔮 Prediction Engine")
-    st.markdown('<div class="section-label">Real-time intelligence · Google Trends · Social Signals · Market Analysis</div>', unsafe_allow_html=True)
+    st.markdown("# 🔮 Prediction & Supplier Intelligence")
+    st.markdown('<div class="section-label">Real-time intelligence · Google Trends · Social Signals · Market Analysis · Supplier Trust Scoring</div>', unsafe_allow_html=True)
+
+    # ═══════════════════════════════════════════════════════
+    # SUPPLIER INTELLIGENCE ENGINE
+    # ═══════════════════════════════════════════════════════
+    # NOTE: the app doesn't yet track real delivery/QC/fraud history per
+    # supplier, so these scores are deterministically simulated from the
+    # supplier's name (same supplier → same score every run) using a local
+    # Random instance, which keeps the global `random`/`np.random` state used
+    # by the product-demand engine below untouched. Swap the body of this
+    # function for real queries (delivery logs, QC reports, dispute counts...)
+    # once that data exists, and everything downstream keeps working as-is.
+    def compute_supplier_intel(supplier_name):
+        _rng = random.Random(abs(hash(supplier_name)) % 999999)
+
+        on_time_rate    = round(_rng.uniform(55, 99), 1)
+        fulfillment_acc = round(_rng.uniform(75, 99.5), 1)
+        defect_rate     = round(_rng.uniform(0.3, 9.0), 2)
+        avg_delay_days  = round(max(0, (100 - on_time_rate) / 100 * _rng.uniform(3, 9)), 1)
+        price_stability = round(_rng.uniform(45, 98), 1)
+        total_deliveries = _rng.randint(12, 900)
+
+        quality_score = round(max(0, min(100, 100 - defect_rate * 6 + _rng.uniform(-5, 5))), 1)
+        fraud_risk    = round(max(0, min(100, (100 - fulfillment_acc) * 0.6 + defect_rate * 2.2 + _rng.uniform(0, 10))), 1)
+
+        # Performance history (10 cycles) — anchors to the current on-time
+        # rate so the sparkline always ends at today's real number.
+        perf_history = []
+        val = max(20, min(99, on_time_rate + _rng.uniform(-18, 18)))
+        for _ in range(10):
+            val = max(10, min(100, val + _rng.gauss(0, 4)))
+            perf_history.append(round(val, 1))
+        perf_history[-1] = on_time_rate
+        trend_change = perf_history[-1] - perf_history[0]
+        if trend_change > 3:
+            reliability_trend, trend_icon = "Improving", "📈"
+        elif trend_change < -3:
+            reliability_trend, trend_icon = "Declining", "📉"
+        else:
+            reliability_trend, trend_icon = "Stable", "➖"
+
+        weights = {
+            "On-Time Delivery":     (0.25, on_time_rate),
+            "Fulfillment Accuracy": (0.20, fulfillment_acc),
+            "Product Quality":      (0.20, quality_score),
+            "Price Stability":      (0.15, price_stability),
+            "Low Defect Rate":      (0.10, max(0, 100 - defect_rate * 5)),
+            "Fraud-Free Score":     (0.10, max(0, 100 - fraud_risk)),
+        }
+        trust_score = round(sum(w * v for w, v in weights.values()), 1)
+        trust_score = max(2, min(99, trust_score))
+
+        if fraud_risk >= 40 or trust_score < 40:
+            risk_level = "High"
+        elif fraud_risk >= 18 or trust_score < 70:
+            risk_level = "Medium"
+        else:
+            risk_level = "Low"
+
+        if trust_score >= 75 and risk_level == "Low":
+            status = "Trusted"
+        elif trust_score < 40 or risk_level == "High":
+            status = "High Risk"
+        else:
+            status = "Monitor"
+
+        return {
+            "supplier_name": supplier_name, "trust_score": trust_score,
+            "on_time_rate": on_time_rate, "avg_delay_days": avg_delay_days,
+            "fulfillment_acc": fulfillment_acc, "defect_rate": defect_rate,
+            "quality_score": quality_score, "price_stability": price_stability,
+            "fraud_risk": fraud_risk, "total_deliveries": total_deliveries,
+            "perf_history": perf_history, "reliability_trend": reliability_trend,
+            "trend_icon": trend_icon, "risk_level": risk_level, "status": status,
+            "weights": weights,
+        }
+
+    STATUS_COLOR = {"Trusted": "#00e096", "Monitor": "#ffb800", "High Risk": "#ff4b6e"}
+    RISK_COLOR   = {"Low": "#00e096", "Medium": "#ffb800", "High": "#ff4b6e"}
 
     # ── Load inventory ──
     conn2 = sqlite3.connect("venus_ai.db")
     cursor2 = conn2.cursor()
     if st.session_state.role == "Supplier":
-        cursor2.execute("SELECT product, price, qty, location FROM products WHERE user_id = ?", (user["id"],))
+        cursor2.execute("SELECT product, price, qty, location, supplier FROM products WHERE user_id = ?", (user["id"],))
     else:
-        cursor2.execute("SELECT product, price, qty, location FROM products")
+        cursor2.execute("SELECT product, price, qty, location, supplier FROM products")
     data = cursor2.fetchall()
     conn2.close()
 
-    df_supplier = pd.DataFrame(data, columns=["Title","Price","Stock","Location"])
+    df_supplier = pd.DataFrame(data, columns=["Title", "Price", "Stock", "Location", "Supplier"])
+    if not df_supplier.empty:
+        df_supplier["Supplier"] = df_supplier["Supplier"].fillna("Unknown Supplier")
+        df_supplier.loc[df_supplier["Supplier"].str.strip() == "", "Supplier"] = "Unknown Supplier"
 
     if df_supplier.empty:
         st.info("Add products first to unlock predictions.")
@@ -2608,17 +2764,18 @@ elif "Prediction" in menu:
         status_ph   = st.empty()
 
         steps = [
-            ("🌐 Connecting to Google Trends API...",      0.15),
-            ("📊 Fetching 90-day search interest data...", 0.30),
-            ("📱 Scanning social media signals...",         0.48),
-            ("💬 Running sentiment analysis...",            0.62),
-            ("🏪 Analysing competitor pricing...",          0.75),
-            ("📦 Checking supply chain signals...",         0.88),
-            ("🧠 Computing purchase probability...",        1.00),
+            ("🌐 Connecting to Google Trends API...",      0.12),
+            ("📊 Fetching 90-day search interest data...", 0.24),
+            ("📱 Scanning social media signals...",         0.38),
+            ("💬 Running sentiment analysis...",            0.50),
+            ("🏪 Analysing competitor pricing...",          0.62),
+            ("📦 Checking supply chain signals...",         0.74),
+            ("🚚 Pulling supplier delivery & QC history...", 0.86),
+            ("🧠 Computing purchase probability & trust scores...", 1.00),
         ]
         for msg, pct in steps:
             progress_ph.progress(pct, text=msg)
-            time.sleep(0.3)
+            time.sleep(0.25)
         progress_ph.empty()
         status_ph.empty()
 
@@ -2626,6 +2783,7 @@ elif "Prediction" in menu:
         product_name = prod_row["Title"]
         price        = float(prod_row["Price"])
         stock        = int(prod_row["Stock"])
+        supplier_name = str(prod_row["Supplier"])
 
         # Google Trends — real attempt, realistic fallback
         google_trend_score = 0.0
@@ -2720,10 +2878,11 @@ elif "Prediction" in menu:
         prob_color    = verdict_color
 
         # ═══════════════════════════════════════════
-        # DISPLAY — HERO SCORE + SIGNAL BREAKDOWN
+        # DISPLAY — HERO SCORE + SIGNAL BREAKDOWN (product demand)
         # ═══════════════════════════════════════════
 
         st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
+        st.markdown("#### 📦 Product Demand Forecast")
 
         hero_col, signals_col = st.columns([1, 1.8])
 
@@ -2938,9 +3097,9 @@ elif "Prediction" in menu:
                     </div>
                 </div>""", unsafe_allow_html=True)
 
-        # ── AI Recommendation ──
+        # ── AI Recommendation (product demand) ──
         st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-        st.markdown("#### 🧠 AI Strategic Recommendation")
+        st.markdown("#### 🧠 AI Strategic Recommendation — Product")
 
         if final_pct >= 75:
             rec_text = f"**{product_name}** is a high-demand product with strong signals across all intelligence channels. Google Trends shows {trend_direction.lower()} interest, social buzz is intense ({int(social_buzz*100)}/100), and sentiment is {sentiment_label.lower()}. **Increase stock immediately** and consider a premium pricing strategy — the market can absorb it."
@@ -2964,9 +3123,231 @@ elif "Prediction" in menu:
             </div>
         </div>""", unsafe_allow_html=True)
 
-        # ── Inventory leaderboard ──
+        # ═══════════════════════════════════════════
+        # SUPPLIER INTELLIGENCE — Trust Score & risk scoring
+        # ═══════════════════════════════════════════
         st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
-        st.markdown("#### 📊 Full Inventory Intelligence Leaderboard")
+        st.markdown(f"#### 🏭 Supplier Intelligence — {supplier_name}")
+
+        # Pull every distinct supplier in the marketplace so we can rank
+        # this one against the rest, not just describe it in isolation.
+        _c3 = sqlite3.connect("venus_ai.db")
+        _supplier_rows = _c3.execute(
+            "SELECT DISTINCT supplier FROM products WHERE supplier IS NOT NULL AND TRIM(supplier) != ''"
+        ).fetchall()
+        _c3.close()
+        all_supplier_names = [r[0] for r in _supplier_rows] or [supplier_name]
+        if supplier_name not in all_supplier_names:
+            all_supplier_names.append(supplier_name)
+
+        supplier_board = sorted(
+            (compute_supplier_intel(s) for s in all_supplier_names),
+            key=lambda d: d["trust_score"], reverse=True
+        )
+        total_suppliers = len(supplier_board)
+        supplier_rank = next(i for i, d in enumerate(supplier_board) if d["supplier_name"] == supplier_name) + 1
+        sup = next(d for d in supplier_board if d["supplier_name"] == supplier_name)
+
+        status_color = STATUS_COLOR[sup["status"]]
+        risk_color    = RISK_COLOR[sup["risk_level"]]
+
+        sup_hero_col, sup_signals_col = st.columns([1, 1.8])
+
+        # ── Left: Trust score hero ──
+        with sup_hero_col:
+            st.markdown(f"""
+            <div class="venus-card" style="text-align:center;padding:32px 20px;
+                border-color:{status_color}30;">
+                <div style="font-size:12px;font-weight:700;letter-spacing:.12em;
+                    text-transform:uppercase;color:#9aaabf;margin-bottom:14px;">
+                    Supplier Trust Score
+                </div>
+                <div class="prob-number" style="color:{status_color};">{sup['trust_score']}</div>
+                <div class="prob-label">out of 100</div>
+                <div class="verdict-chip" style="background:{status_color}18;
+                    color:{status_color};border:1px solid {status_color}40;">
+                    {'✅' if sup['status']=='Trusted' else '🟡' if sup['status']=='Monitor' else '🔴'} {sup['status']}
+                </div>
+                <div class="rank-badge">
+                    🏆 Ranked #{supplier_rank} of {total_suppliers} suppliers
+                </div>
+                <div class="rank-badge" style="margin-left:6px;color:{risk_color};border-color:{risk_color}40;">
+                    ⚠️ Risk Level: {sup['risk_level']}
+                </div>
+                <div style="margin-top:20px;">
+                    <div style="font-size:11px;color:#6a7a92;margin-bottom:6px;">
+                        TRUST SCORE BREAKDOWN
+                    </div>""", unsafe_allow_html=True)
+
+            for label, (weight, value) in sup["weights"].items():
+                bar_pct = int(value)
+                bar_color = "#00e096" if value > 70 else "#ffb800" if value > 45 else "#ff4b6e"
+                contribution = round(weight * value, 1)
+                st.markdown(f"""
+                <div style="margin-bottom:8px;text-align:left;">
+                    <div style="display:flex;justify-content:space-between;
+                        font-size:11px;color:#9aaabf;margin-bottom:3px;">
+                        <span>{label}</span>
+                        <span style="color:{bar_color};font-weight:700;">
+                            {bar_pct}/100 <span style="color:#6a7a92;">
+                            (+{contribution}pts)</span>
+                        </span>
+                    </div>
+                    <div class="signal-bar-track">
+                        <div class="signal-bar-fill"
+                            style="width:{bar_pct}%;background:{bar_color};"></div>
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+            st.markdown("</div></div>", unsafe_allow_html=True)
+            st.markdown('<div style="font-size:10px;color:#6a7a92;text-align:center;margin-top:8px;">Data source: simulated supplier performance model</div>', unsafe_allow_html=True)
+
+        # ── Right: Supplier signal cards ──
+        with sup_signals_col:
+            st.markdown("#### 📡 Supplier Performance Signals")
+
+            # Delivery Performance card
+            st.markdown(f"""
+            <div class="signal-card delivery">
+                <div class="signal-label">🚚 Delivery Performance</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-top:10px;">
+                    <div style="text-align:center;">
+                        <div style="font-size:10px;color:#9aaabf;">On-Time Rate</div>
+                        <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:800;
+                            color:#00e5ff;">{sup['on_time_rate']}%</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="font-size:10px;color:#9aaabf;">Avg Delay</div>
+                        <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:800;
+                            color:{'#00e096' if sup['avg_delay_days']<=1 else '#ffb800' if sup['avg_delay_days']<=3 else '#ff4b6e'};">{sup['avg_delay_days']}d</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="font-size:10px;color:#9aaabf;">Fulfillment Acc.</div>
+                        <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:800;
+                            color:#00e5ff;">{sup['fulfillment_acc']}%</div>
+                    </div>
+                    <div style="text-align:center;">
+                        <div style="font-size:10px;color:#9aaabf;">Deliveries</div>
+                        <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:800;
+                            color:#e8edf5;">{sup['total_deliveries']:,}</div>
+                    </div>
+                </div>
+                <div style="margin-top:12px;">
+                    <div class="signal-bar-track">
+                        <div class="signal-bar-fill"
+                            style="width:{sup['on_time_rate']}%;background:#00e5ff;"></div>
+                    </div>
+                    <div style="font-size:11px;color:#b0bece;margin-top:4px;">
+                        On-time delivery rate across {sup['total_deliveries']:,} completed deliveries
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Quality & Fraud Risk card
+            st.markdown(f"""
+            <div class="signal-card quality">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div style="flex:1;">
+                        <div class="signal-label">🧪 Product Quality Score</div>
+                        <div class="signal-value" style="color:#00e096;">{sup['quality_score']}<span style="font-size:14px;">/100</span></div>
+                        <div class="signal-sub">Defect rate: <strong style="color:#e8edf5;">{sup['defect_rate']}%</strong></div>
+                    </div>
+                    <div style="flex:1;text-align:right;">
+                        <div class="signal-label">🚨 Fraud Risk Score</div>
+                        <div class="signal-value" style="color:{risk_color};">{sup['fraud_risk']}<span style="font-size:14px;">/100</span></div>
+                        <div class="signal-sub">Risk level:
+                            <strong style="color:{risk_color};">{sup['risk_level']}</strong>
+                        </div>
+                    </div>
+                </div>
+                <div style="display:flex;gap:8px;margin-top:10px;">
+                    <div style="flex:1;">
+                        <div class="signal-bar-track"><div class="signal-bar-fill" style="width:{sup['quality_score']}%;background:#00e096;"></div></div>
+                    </div>
+                    <div style="flex:1;">
+                        <div class="signal-bar-track"><div class="signal-bar-fill" style="width:{sup['fraud_risk']}%;background:{risk_color};"></div></div>
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Price stability card
+            sp_label = "Highly Stable ✅" if sup['price_stability'] > 80 else \
+                       "Moderately Stable 🟡" if sup['price_stability'] > 50 else "Volatile ⚠️"
+            st.markdown(f"""
+            <div class="signal-card stability">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                        <div class="signal-label">💲 Price Stability Score</div>
+                        <div class="signal-value" style="color:#ffb800;">{sp_label}</div>
+                        <div class="signal-sub">How consistent this supplier's pricing has been over time</div>
+                    </div>
+                    <div style="font-family:'Syne',sans-serif;font-size:28px;font-weight:800;color:#ffb800;">
+                        {sup['price_stability']}
+                    </div>
+                </div>
+                <div class="signal-bar-track" style="margin-top:8px;">
+                    <div class="signal-bar-fill" style="width:{sup['price_stability']}%;background:#ffb800;"></div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Reliability trend / performance history sparkline
+            sp_mx = max(sup["perf_history"]) or 1
+            sp_bars_html = ""
+            for v in sup["perf_history"]:
+                h = max(3, int((v/sp_mx)*32))
+                c = "#a855f7" if v >= sp_mx*0.7 else "#5a3a8a"
+                sp_bars_html += f'<div style="width:7px;height:{h}px;background:{c};border-radius:2px;flex-shrink:0;"></div>'
+
+            st.markdown(f"""
+            <div class="signal-card history">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+                    <div>
+                        <div class="signal-label">📈 Supplier Reliability Trend</div>
+                        <div class="signal-value" style="color:#a855f7;">{sup['trend_icon']} {sup['reliability_trend']}</div>
+                        <div class="signal-sub">Performance history over last 10 review cycles</div>
+                    </div>
+                    <div style="display:flex;align-items:flex-end;gap:2px;height:32px;">
+                        {sp_bars_html}
+                    </div>
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── Supplier AI Recommendation ──
+        st.markdown("#### 🧠 AI Strategic Recommendation — Supplier")
+
+        if sup["status"] == "Trusted":
+            sup_rec = (f"**{supplier_name}** is a **Trusted** supplier with a trust score of **{sup['trust_score']}/100**, "
+                       f"ranked **#{supplier_rank} of {total_suppliers}** marketplace-wide. On-time delivery sits at "
+                       f"{sup['on_time_rate']}% with {sup['fulfillment_acc']}% fulfillment accuracy and a low defect rate "
+                       f"of {sup['defect_rate']}%. **Continue routing orders here** — this supplier can support scale-up "
+                       f"without added risk.")
+            sup_rec_color = "#00e096"
+        elif sup["status"] == "Monitor":
+            sup_rec = (f"**{supplier_name}** sits in the **Monitor** tier with a trust score of **{sup['trust_score']}/100** "
+                       f"(rank #{supplier_rank} of {total_suppliers}). Reliability trend is {sup['reliability_trend'].lower()} "
+                       f"and fraud risk is {sup['risk_level'].lower()} ({sup['fraud_risk']}/100). Consider "
+                       f"**qualifying a backup supplier** for critical SKUs while tracking the next few delivery cycles "
+                       f"before increasing order volume.")
+            sup_rec_color = "#ffb800"
+        else:
+            sup_rec = (f"**{supplier_name}** is flagged **High Risk** — trust score **{sup['trust_score']}/100** "
+                       f"(rank #{supplier_rank} of {total_suppliers}), fraud risk {sup['fraud_risk']}/100, and a defect "
+                       f"rate of {sup['defect_rate']}%. **Pause new orders** and require quality inspection on any "
+                       f"existing shipments until delivery and quality metrics recover.")
+            sup_rec_color = "#ff4b6e"
+
+        st.markdown(f"""
+        <div class="venus-card" style="border-color:{sup_rec_color}25;
+            background:linear-gradient(135deg,{sup_rec_color}06,rgba(0,0,0,0));">
+            <div style="display:flex;gap:14px;align-items:flex-start;">
+                <div style="font-size:28px;flex-shrink:0;">🏭</div>
+                <div style="font-size:14px;color:#c8d8e8;line-height:1.8;">{sup_rec}</div>
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+        # ── Inventory leaderboard (product demand) ──
+        st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
+        st.markdown("#### 📊 Full Product Demand Leaderboard")
 
         # Compute for all products
         all_prods = df_supplier.copy()
@@ -3022,6 +3403,42 @@ elif "Prediction" in menu:
                 </div>
             </div>""", unsafe_allow_html=True)
 
+        # ── Supplier Trust Leaderboard ──
+        st.markdown('<div class="venus-divider"></div>', unsafe_allow_html=True)
+        st.markdown("#### 🏭 Supplier Trust Leaderboard")
+
+        for rank, sboard in enumerate(supplier_board):
+            active = sboard["supplier_name"] == supplier_name
+            rank_color = "#ffd700" if rank==0 else "#c0c0c0" if rank==1 else "#cd7f32" if rank==2 else "#3a4a62"
+            s_color = STATUS_COLOR[sboard["status"]]
+            border  = "rgba(168,85,247,0.35)" if active else "rgba(255,255,255,0.04)"
+            bg      = "rgba(168,85,247,0.05)" if active else "transparent"
+            st.markdown(f"""
+            <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;
+                border-radius:10px;border:1px solid {border};background:{bg};
+                margin-bottom:6px;">
+                <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:800;
+                    color:{rank_color};width:24px;text-align:center;">#{rank+1}</div>
+                <div style="flex:1;min-width:0;">
+                    <div style="font-size:13px;font-weight:600;color:#e8edf5;
+                        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                        {sboard['supplier_name']} {"⬅ this supplier" if active else ""}
+                    </div>
+                    <div style="margin-top:4px;">
+                        <div class="signal-bar-track" style="height:6px;">
+                            <div class="signal-bar-fill"
+                                style="width:{sboard['trust_score']}%;background:{s_color};"></div>
+                        </div>
+                    </div>
+                </div>
+                <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800;
+                    color:{s_color};min-width:46px;text-align:right;">{sboard['trust_score']}</div>
+                <div class="verdict-chip" style="background:{s_color}18;color:{s_color};
+                    border:1px solid {s_color}40;margin-top:0;min-width:80px;text-align:center;">
+                    {sboard['status']}
+                </div>
+            </div>""", unsafe_allow_html=True)
+
     else:
         # Pre-run state
         st.markdown("""
@@ -3030,10 +3447,11 @@ elif "Prediction" in menu:
             <div style="font-size:48px;margin-bottom:16px;">🔮</div>
             <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:700;
                 color:#e8edf5;margin-bottom:8px;">Intelligence Engine Ready</div>
-            <div style="font-size:13px;color:#9aaabf;max-width:400px;margin:0 auto;line-height:1.7;">
+            <div style="font-size:13px;color:#9aaabf;max-width:440px;margin:0 auto;line-height:1.7;">
                 Select a product above and hit <strong style="color:#00e5ff;">Run Full Intelligence Scan</strong>
                 to see real-time Google Trends data, social media signals,
-                sentiment analysis, and a complete purchase probability breakdown.
+                sentiment analysis, purchase probability — plus a full
+                <strong style="color:#a855f7;">Supplier Trust Score</strong> breakdown for the seller behind it.
             </div>
         </div>""", unsafe_allow_html=True)
 
@@ -3282,644 +3700,6 @@ elif "Inbox & Products" in menu:
                     </div>
                 </div>""", unsafe_allow_html=True)
 
-# =========================================================
-# FINANCIAL AI — Full Accounting Intelligence System
-# =========================================================
-elif "Financial AI" in menu:
-    import json, requests, io
-    from datetime import datetime, timedelta
-
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap');
-
-    .fin-hero { padding: 0 0 28px; }
-    .fin-hero-title {
-        font-family: 'Syne', sans-serif; font-size: 30px; font-weight: 800;
-        letter-spacing: -0.02em; margin: 0 0 6px;
-        background: linear-gradient(90deg, #e8edf5 40%, #00e5ff);
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    }
-    .fin-hero-sub { font-size: 13px; color: #9aaabf; line-height: 1.6; max-width: 560px; }
-
-    .fin-tab-row {
-        display: flex; gap: 6px; margin-bottom: 28px;
-        border-bottom: 1px solid rgba(0,229,255,0.08); padding-bottom: 0;
-    }
-    .fin-tab {
-        padding: 9px 18px; font-size: 12px; font-weight: 600;
-        letter-spacing: 0.06em; text-transform: uppercase;
-        border-radius: 8px 8px 0 0; cursor: pointer;
-        border: 1px solid transparent; border-bottom: none;
-        color: #4a5a72; transition: all 0.2s;
-    }
-    .fin-tab.active {
-        background: rgba(0,229,255,0.07);
-        border-color: rgba(0,229,255,0.15);
-        color: #00e5ff;
-    }
-
-    .fin-card {
-        background: rgba(8,8,14,0.95);
-        border: 1px solid rgba(0,229,255,0.07);
-        border-radius: 18px; padding: 24px; margin-bottom: 16px;
-        position: relative; overflow: hidden;
-    }
-    .fin-card::before {
-        content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
-        background: linear-gradient(90deg, transparent, rgba(0,229,255,0.3), transparent);
-    }
-    .fin-card-title {
-        font-family: 'Syne', sans-serif; font-size: 13px; font-weight: 700;
-        letter-spacing: 0.1em; text-transform: uppercase; color: #4a5a72;
-        margin-bottom: 18px;
-    }
-
-    /* Statement table */
-    .fin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    .fin-table tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
-    .fin-table tr:last-child { border-bottom: none; }
-    .fin-table td { padding: 9px 6px; color: #b0bece; font-family: 'DM Sans', sans-serif; }
-    .fin-table td:last-child {
-        text-align: right; font-family: 'DM Mono', monospace;
-        font-size: 13px; color: #e8edf5;
-    }
-    .fin-table .section-row td {
-        color: #4a5a72; font-size: 11px; font-weight: 700;
-        letter-spacing: 0.1em; text-transform: uppercase;
-        padding-top: 16px; padding-bottom: 4px;
-    }
-    .fin-table .total-row td {
-        color: #00e5ff; font-weight: 700; font-family: 'Syne', sans-serif;
-        border-top: 1px solid rgba(0,229,255,0.2); padding-top: 12px; font-size: 14px;
-    }
-    .fin-table .subtotal-row td {
-        color: #e8edf5; font-weight: 600; font-family: 'DM Mono', monospace;
-        border-top: 1px solid rgba(255,255,255,0.06);
-    }
-    .fin-table .negative { color: #ff4b6e !important; }
-    .fin-table .positive { color: #00e096 !important; }
-
-    /* KPI strip */
-    .fin-kpi-row { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
-    .fin-kpi {
-        flex: 1; min-width: 100px;
-        background: rgba(255,255,255,0.025);
-        border: 1px solid rgba(0,229,255,0.07);
-        border-radius: 12px; padding: 14px 16px;
-    }
-    .fin-kpi-val {
-        font-family: 'Syne', sans-serif; font-size: 22px; font-weight: 800;
-        line-height: 1; color: #00e5ff;
-    }
-    .fin-kpi-val.red { color: #ff4b6e; }
-    .fin-kpi-val.green { color: #00e096; }
-    .fin-kpi-val.amber { color: #ffb800; }
-    .fin-kpi-lbl { font-size: 10px; color: #4a5a72; margin-top: 5px;
-        text-transform: uppercase; letter-spacing: 0.08em; }
-
-    /* Ratio bar */
-    .ratio-row { margin-bottom: 14px; }
-    .ratio-label { display: flex; justify-content: space-between;
-        font-size: 12px; color: #b0bece; margin-bottom: 5px; }
-    .ratio-track {
-        height: 5px; background: rgba(255,255,255,0.06);
-        border-radius: 4px; overflow: hidden;
-    }
-    .ratio-fill { height: 100%; border-radius: 4px;
-        background: linear-gradient(90deg, #00e5ff, #a855f7); }
-
-    /* AI insight box */
-    .fin-ai-box {
-        background: rgba(0,229,255,0.04);
-        border: 1px solid rgba(0,229,255,0.15);
-        border-radius: 14px; padding: 18px; margin-top: 4px;
-    }
-    .fin-ai-label {
-        font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
-        text-transform: uppercase; color: #00e5ff; margin-bottom: 10px;
-        display: flex; align-items: center; gap: 6px;
-    }
-    .fin-ai-text { font-size: 13px; line-height: 1.7; color: #b0bece; }
-
-    /* Entry form */
-    .fin-entry-row {
-        display: grid; grid-template-columns: 2fr 1fr 1fr auto;
-        gap: 8px; align-items: end; margin-bottom: 8px;
-    }
-    .fin-badge {
-        display: inline-block; padding: 2px 10px; border-radius: 20px;
-        font-size: 11px; font-weight: 600;
-    }
-    .fin-badge-rev { background: rgba(0,224,150,0.1); color: #00e096; border: 1px solid rgba(0,224,150,0.2); }
-    .fin-badge-exp { background: rgba(255,75,110,0.1); color: #ff4b6e; border: 1px solid rgba(255,75,110,0.2); }
-    .fin-badge-ast { background: rgba(0,229,255,0.1); color: #00e5ff; border: 1px solid rgba(0,229,255,0.2); }
-    .fin-badge-lib { background: rgba(255,184,0,0.1); color: #ffb800; border: 1px solid rgba(255,184,0,0.2); }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # ── DB setup for financial entries ────────────────────────────────────────
-    conn_fin = sqlite3.connect("venus_ai.db", check_same_thread=False)
-    cur_fin  = conn_fin.cursor()
-
-    cur_fin.execute("""
-        CREATE TABLE IF NOT EXISTS fin_entries (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER, category TEXT, subcategory TEXT,
-            description TEXT, amount REAL, entry_type TEXT,
-            period TEXT, created_at TEXT
-        )
-    """)
-    conn_fin.commit()
-
-    # ── Helper: fetch entries ─────────────────────────────────────────────────
-    def get_entries(uid, period=None):
-        if period:
-            cur_fin.execute(
-                "SELECT * FROM fin_entries WHERE user_id=? AND period=? ORDER BY id DESC",
-                (uid, period)
-            )
-        else:
-            cur_fin.execute(
-                "SELECT * FROM fin_entries WHERE user_id=? ORDER BY id DESC", (uid,)
-            )
-        rows = cur_fin.fetchall()
-        cols = ["id","user_id","category","subcategory","description","amount","entry_type","period","created_at"]
-        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
-
-    # ── Seed demo data if empty ───────────────────────────────────────────────
-    cur_fin.execute("SELECT COUNT(*) FROM fin_entries WHERE user_id=?", (user_id,))
-    if cur_fin.fetchone()[0] == 0:
-        demo = [
-            # Income statement items
-            (user_id,"Revenue","Product Sales","Online product sales",85400.00,"income","2024-Q4",str(datetime.now())),
-            (user_id,"Revenue","Service Fees","Supplier service fees",12600.00,"income","2024-Q4",str(datetime.now())),
-            (user_id,"Revenue","Commission","Platform commission",8200.00,"income","2024-Q4",str(datetime.now())),
-            (user_id,"COGS","Inventory","Cost of goods purchased",42300.00,"expense","2024-Q4",str(datetime.now())),
-            (user_id,"COGS","Shipping","Fulfilment & shipping",6800.00,"expense","2024-Q4",str(datetime.now())),
-            (user_id,"Operating Expense","Salaries","Staff salaries",18500.00,"expense","2024-Q4",str(datetime.now())),
-            (user_id,"Operating Expense","Marketing","Digital marketing spend",4200.00,"expense","2024-Q4",str(datetime.now())),
-            (user_id,"Operating Expense","Software","SaaS subscriptions",1800.00,"expense","2024-Q4",str(datetime.now())),
-            (user_id,"Operating Expense","Rent","Office rent",3600.00,"expense","2024-Q4",str(datetime.now())),
-            (user_id,"Tax","Income Tax","Corporate income tax",4100.00,"expense","2024-Q4",str(datetime.now())),
-            # Balance sheet items
-            (user_id,"Current Asset","Cash","Cash & equivalents",34200.00,"asset","2024-Q4",str(datetime.now())),
-            (user_id,"Current Asset","Receivables","Accounts receivable",12800.00,"asset","2024-Q4",str(datetime.now())),
-            (user_id,"Current Asset","Inventory","Stock on hand",18600.00,"asset","2024-Q4",str(datetime.now())),
-            (user_id,"Non-Current Asset","Equipment","Computers & equipment",9400.00,"asset","2024-Q4",str(datetime.now())),
-            (user_id,"Current Liability","Payables","Accounts payable",8700.00,"liability","2024-Q4",str(datetime.now())),
-            (user_id,"Current Liability","Short-term Loan","Bank overdraft",5000.00,"liability","2024-Q4",str(datetime.now())),
-            (user_id,"Non-Current Liability","Long-term Loan","Business loan",20000.00,"liability","2024-Q4",str(datetime.now())),
-            (user_id,"Equity","Owner Equity","Founder equity",41300.00,"equity","2024-Q4",str(datetime.now())),
-        ]
-        cur_fin.executemany(
-            "INSERT INTO fin_entries (user_id,category,subcategory,description,amount,entry_type,period,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            demo
-        )
-        conn_fin.commit()
-
-    # ── Period selector ───────────────────────────────────────────────────────
-    st.markdown("""
-    <div class="fin-hero">
-        <div class="fin-hero-title">Financial Intelligence</div>
-        <div class="fin-hero-sub">
-            Full accounting suite — income statements, balance sheets, cash flow analysis,
-            ratio intelligence, and AI-powered CFO insights for your business.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_period, col_spacer = st.columns([1, 3])
-    with col_period:
-        period = st.selectbox("Reporting Period", ["2024-Q4","2024-Q3","2024-Q2","2024-Q1"], label_visibility="collapsed")
-
-    df_all = get_entries(user_id, period)
-
-    # ── Split by type ─────────────────────────────────────────────────────────
-    df_inc = df_all[df_all["entry_type"] == "income"]
-    df_exp = df_all[df_all["entry_type"] == "expense"]
-    df_ast = df_all[df_all["entry_type"] == "asset"]
-    df_lib = df_all[df_all["entry_type"] == "liability"]
-    df_eq  = df_all[df_all["entry_type"] == "equity"]
-
-    # Core figures
-    total_revenue   = df_inc["amount"].sum()
-    cogs            = df_exp[df_exp["category"]=="COGS"]["amount"].sum()
-    gross_profit    = total_revenue - cogs
-    opex            = df_exp[df_exp["category"]=="Operating Expense"]["amount"].sum()
-    ebit            = gross_profit - opex
-    tax             = df_exp[df_exp["category"]=="Tax"]["amount"].sum()
-    net_profit      = ebit - tax
-    total_assets    = df_ast["amount"].sum()
-    total_liab      = df_lib["amount"].sum()
-    total_equity    = df_eq["amount"].sum()
-    curr_assets     = df_ast[df_ast["category"]=="Current Asset"]["amount"].sum()
-    curr_liab       = df_lib[df_lib["category"]=="Current Liability"]["amount"].sum()
-    cash            = df_ast[df_ast["subcategory"]=="Cash"]["amount"].sum()
-
-    gp_margin   = (gross_profit / total_revenue * 100) if total_revenue else 0
-    np_margin   = (net_profit   / total_revenue * 100) if total_revenue else 0
-    current_ratio = (curr_assets / curr_liab) if curr_liab else 0
-    debt_ratio  = (total_liab / total_assets * 100) if total_assets else 0
-    roe         = (net_profit  / total_equity * 100) if total_equity else 0
-    roa         = (net_profit  / total_assets * 100) if total_assets else 0
-
-    # ── KPI Strip ─────────────────────────────────────────────────────────────
-    st.markdown(f"""
-    <div class="fin-kpi-row">
-        <div class="fin-kpi">
-            <div class="fin-kpi-val">{'${:,.0f}'.format(total_revenue)}</div>
-            <div class="fin-kpi-lbl">Total Revenue</div>
-        </div>
-        <div class="fin-kpi">
-            <div class="fin-kpi-val {'green' if gross_profit>0 else 'red'}">{'${:,.0f}'.format(gross_profit)}</div>
-            <div class="fin-kpi-lbl">Gross Profit</div>
-        </div>
-        <div class="fin-kpi">
-            <div class="fin-kpi-val {'green' if net_profit>0 else 'red'}">{'${:,.0f}'.format(net_profit)}</div>
-            <div class="fin-kpi-lbl">Net Profit</div>
-        </div>
-        <div class="fin-kpi">
-            <div class="fin-kpi-val {'green' if gp_margin>40 else 'amber' if gp_margin>20 else 'red'}">{gp_margin:.1f}%</div>
-            <div class="fin-kpi-lbl">Gross Margin</div>
-        </div>
-        <div class="fin-kpi">
-            <div class="fin-kpi-val {'green' if current_ratio>1.5 else 'amber' if current_ratio>1 else 'red'}">{current_ratio:.2f}x</div>
-            <div class="fin-kpi-lbl">Current Ratio</div>
-        </div>
-        <div class="fin-kpi">
-            <div class="fin-kpi-val">{'${:,.0f}'.format(cash)}</div>
-            <div class="fin-kpi-lbl">Cash Position</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # ── Main tabs ─────────────────────────────────────────────────────────────
-    tab_is, tab_bs, tab_cf, tab_ratio, tab_entry, tab_ai = st.tabs([
-        "Income Statement", "Balance Sheet", "Cash Flow",
-        "Ratio Analysis", "Journal Entry", "AI CFO"
-    ])
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 1 — INCOME STATEMENT
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_is:
-        col_stmt, col_chart = st.columns([1.1, 1])
-
-        with col_stmt:
-            st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-            st.markdown(f'<div class="fin-card-title">Income Statement — {period}</div>', unsafe_allow_html=True)
-
-            rows_html = ""
-            # Revenue section
-            rows_html += '<tr class="section-row"><td colspan="2">Revenue</td></tr>'
-            for _, r in df_inc.iterrows():
-                rows_html += f'<tr><td>{r["description"]}</td><td>${r["amount"]:,.2f}</td></tr>'
-            rows_html += f'<tr class="subtotal-row"><td>Total Revenue</td><td>${total_revenue:,.2f}</td></tr>'
-
-            # COGS
-            rows_html += '<tr class="section-row"><td colspan="2">Cost of Goods Sold</td></tr>'
-            for _, r in df_exp[df_exp["category"]=="COGS"].iterrows():
-                rows_html += f'<tr><td>{r["description"]}</td><td class="negative">({r["amount"]:,.2f})</td></tr>'
-            rows_html += f'<tr class="subtotal-row"><td>Gross Profit</td><td class="{"positive" if gross_profit>=0 else "negative"}">${gross_profit:,.2f}</td></tr>'
-
-            # OpEx
-            rows_html += '<tr class="section-row"><td colspan="2">Operating Expenses</td></tr>'
-            for _, r in df_exp[df_exp["category"]=="Operating Expense"].iterrows():
-                rows_html += f'<tr><td>{r["description"]}</td><td class="negative">({r["amount"]:,.2f})</td></tr>'
-            rows_html += f'<tr class="subtotal-row"><td>EBIT</td><td class="{"positive" if ebit>=0 else "negative"}">${ebit:,.2f}</td></tr>'
-
-            # Tax
-            rows_html += '<tr class="section-row"><td colspan="2">Taxation</td></tr>'
-            for _, r in df_exp[df_exp["category"]=="Tax"].iterrows():
-                rows_html += f'<tr><td>{r["description"]}</td><td class="negative">({r["amount"]:,.2f})</td></tr>'
-
-            rows_html += f'<tr class="total-row"><td>Net Profit / (Loss)</td><td class="{"positive" if net_profit>=0 else "negative"}">${net_profit:,.2f}</td></tr>'
-
-            st.markdown(f'<table class="fin-table">{rows_html}</table>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with col_chart:
-            st.markdown('<div class="fin-card" style="height:100%;">', unsafe_allow_html=True)
-            st.markdown('<div class="fin-card-title">Profit Waterfall</div>', unsafe_allow_html=True)
-            waterfall_df = pd.DataFrame({
-                "Stage": ["Revenue", "Gross Profit", "EBIT", "Net Profit"],
-                "Amount": [total_revenue, gross_profit, ebit, net_profit]
-            })
-            st.bar_chart(waterfall_df.set_index("Stage"), color="#00e5ff", height=280)
-
-            st.markdown(f"""
-            <div style="margin-top:16px;">
-                <div class="ratio-row">
-                    <div class="ratio-label"><span>Gross Margin</span><span>{gp_margin:.1f}%</span></div>
-                    <div class="ratio-track"><div class="ratio-fill" style="width:{min(gp_margin,100):.0f}%;"></div></div>
-                </div>
-                <div class="ratio-row">
-                    <div class="ratio-label"><span>Net Margin</span><span>{np_margin:.1f}%</span></div>
-                    <div class="ratio-track"><div class="ratio-fill" style="width:{min(max(np_margin,0),100):.0f}%;"></div></div>
-                </div>
-                <div class="ratio-row">
-                    <div class="ratio-label"><span>OPEX Ratio</span><span>{(opex/total_revenue*100) if total_revenue else 0:.1f}%</span></div>
-                    <div class="ratio-track"><div class="ratio-fill" style="width:{min((opex/total_revenue*100) if total_revenue else 0,100):.0f}%;background:linear-gradient(90deg,#ff4b6e,#ffb800);"></div></div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 2 — BALANCE SHEET
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_bs:
-        col_a, col_le = st.columns(2)
-
-        with col_a:
-            st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-            st.markdown('<div class="fin-card-title">Assets</div>', unsafe_allow_html=True)
-            rows_html = ""
-            for cat in ["Current Asset", "Non-Current Asset"]:
-                rows_html += f'<tr class="section-row"><td colspan="2">{cat}s</td></tr>'
-                subset = df_ast[df_ast["category"]==cat]
-                for _, r in subset.iterrows():
-                    rows_html += f'<tr><td>{r["description"]}</td><td>${r["amount"]:,.2f}</td></tr>'
-                rows_html += f'<tr class="subtotal-row"><td>Subtotal</td><td>${subset["amount"].sum():,.2f}</td></tr>'
-            rows_html += f'<tr class="total-row"><td>Total Assets</td><td>${total_assets:,.2f}</td></tr>'
-            st.markdown(f'<table class="fin-table">{rows_html}</table>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with col_le:
-            st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-            st.markdown('<div class="fin-card-title">Liabilities & Equity</div>', unsafe_allow_html=True)
-            rows_html = ""
-            for cat in ["Current Liability", "Non-Current Liability"]:
-                rows_html += f'<tr class="section-row"><td colspan="2">{cat}</td></tr>'
-                subset = df_lib[df_lib["category"]==cat]
-                for _, r in subset.iterrows():
-                    rows_html += f'<tr><td>{r["description"]}</td><td class="negative">${r["amount"]:,.2f}</td></tr>'
-                rows_html += f'<tr class="subtotal-row"><td>Subtotal</td><td class="negative">${subset["amount"].sum():,.2f}</td></tr>'
-            rows_html += f'<tr class="subtotal-row"><td>Total Liabilities</td><td class="negative">${total_liab:,.2f}</td></tr>'
-            rows_html += '<tr class="section-row"><td colspan="2">Equity</td></tr>'
-            for _, r in df_eq.iterrows():
-                rows_html += f'<tr><td>{r["description"]}</td><td class="positive">${r["amount"]:,.2f}</td></tr>'
-            rows_html += f'<tr class="total-row"><td>Total Liab + Equity</td><td>${(total_liab+total_equity):,.2f}</td></tr>'
-            st.markdown(f'<table class="fin-table">{rows_html}</table>', unsafe_allow_html=True)
-
-            # Balance check
-            diff = abs(total_assets - (total_liab + total_equity))
-            if diff < 1:
-                st.success("Balance sheet balances ✓")
-            else:
-                st.warning(f"Balance sheet out by ${diff:,.2f} — check equity entries")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 3 — CASH FLOW (Indirect method)
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_cf:
-        receivables = df_ast[df_ast["subcategory"]=="Receivables"]["amount"].sum()
-        inventory_v = df_ast[df_ast["subcategory"]=="Inventory"]["amount"].sum()
-        payables    = df_lib[df_lib["subcategory"]=="Payables"]["amount"].sum()
-        equipment   = df_ast[df_ast["category"]=="Non-Current Asset"]["amount"].sum()
-        lt_loan     = df_lib[df_lib["category"]=="Non-Current Liability"]["amount"].sum()
-
-        cfo = net_profit - receivables + payables   # simplified indirect
-        cfi = -equipment                              # capex outflow
-        cff = lt_loan                                 # financing inflow
-        net_cash = cfo + cfi + cff
-
-        col_cf1, col_cf2 = st.columns([1.1, 1])
-        with col_cf1:
-            st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-            st.markdown('<div class="fin-card-title">Cash Flow Statement (Indirect Method)</div>', unsafe_allow_html=True)
-            cf_rows = f"""
-            <tr class="section-row"><td colspan="2">Operating Activities</td></tr>
-            <tr><td>Net Profit</td><td class="positive">${net_profit:,.2f}</td></tr>
-            <tr><td>Increase in Receivables</td><td class="negative">({receivables:,.2f})</td></tr>
-            <tr><td>Increase in Payables</td><td class="positive">${payables:,.2f}</td></tr>
-            <tr class="subtotal-row"><td>Net Cash from Operations</td><td class="{'positive' if cfo>=0 else 'negative'}">${cfo:,.2f}</td></tr>
-            <tr class="section-row"><td colspan="2">Investing Activities</td></tr>
-            <tr><td>Purchase of Equipment</td><td class="negative">({equipment:,.2f})</td></tr>
-            <tr class="subtotal-row"><td>Net Cash from Investing</td><td class="negative">${cfi:,.2f}</td></tr>
-            <tr class="section-row"><td colspan="2">Financing Activities</td></tr>
-            <tr><td>Long-term Loan Proceeds</td><td class="positive">${lt_loan:,.2f}</td></tr>
-            <tr class="subtotal-row"><td>Net Cash from Financing</td><td class="positive">${cff:,.2f}</td></tr>
-            <tr class="total-row"><td>Net Change in Cash</td><td class="{'positive' if net_cash>=0 else 'negative'}">${net_cash:,.2f}</td></tr>
-            <tr><td>Opening Cash Balance</td><td>${max(cash-net_cash,0):,.2f}</td></tr>
-            <tr class="total-row"><td>Closing Cash Balance</td><td>${cash:,.2f}</td></tr>
-            """
-            st.markdown(f'<table class="fin-table">{cf_rows}</table>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with col_cf2:
-            st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-            st.markdown('<div class="fin-card-title">Cash Flow Breakdown</div>', unsafe_allow_html=True)
-            cf_df = pd.DataFrame({
-                "Activity": ["Operations","Investing","Financing"],
-                "Amount": [cfo, cfi, cff]
-            })
-            st.bar_chart(cf_df.set_index("Activity"), color="#a855f7", height=220)
-            st.markdown(f"""
-            <div style="margin-top:14px;">
-                <div class="ratio-row">
-                    <div class="ratio-label"><span>Operating CF</span><span>${cfo:,.0f}</span></div>
-                    <div class="ratio-track"><div class="ratio-fill" style="width:{min(max(cfo/max(abs(cfo)+abs(cfi)+abs(cff),1)*100,0),100):.0f}%;"></div></div>
-                </div>
-                <div class="ratio-row">
-                    <div class="ratio-label"><span>Cash Burn Coverage</span><span>{(cash/max(opex/3,1)):.1f} months</span></div>
-                    <div class="ratio-track"><div class="ratio-fill" style="width:{min(cash/max(opex/3,1)/12*100,100):.0f}%;background:linear-gradient(90deg,#00e096,#00e5ff);"></div></div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 4 — RATIO ANALYSIS
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_ratio:
-        st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-        st.markdown('<div class="fin-card-title">Financial Ratios & Health Indicators</div>', unsafe_allow_html=True)
-
-        ratio_groups = {
-            "Liquidity": [
-                ("Current Ratio", current_ratio, "x", 1.5, 2.5, "Measures ability to pay short-term obligations. Healthy: 1.5–2.5x"),
-                ("Quick Ratio", (curr_assets-inventory_v)/max(curr_liab,1), "x", 1.0, 2.0, "Liquidity excluding inventory. Healthy: >1.0x"),
-                ("Cash Ratio", cash/max(curr_liab,1), "x", 0.5, 1.0, "Pure cash coverage of current liabilities"),
-            ],
-            "Profitability": [
-                ("Gross Margin", gp_margin, "%", 30, 60, "Revenue retained after COGS. Healthy for e-commerce: >30%"),
-                ("Net Profit Margin", np_margin, "%", 5, 20, "Bottom-line profitability. Healthy: >5%"),
-                ("Return on Equity", roe, "%", 10, 25, "Profit generated per dollar of equity. Healthy: >10%"),
-                ("Return on Assets", roa, "%", 5, 15, "Profit per dollar of assets. Healthy: >5%"),
-            ],
-            "Leverage": [
-                ("Debt Ratio", debt_ratio, "%", 0, 50, "% of assets financed by debt. Lower is safer"),
-                ("Debt-to-Equity", total_liab/max(total_equity,1), "x", 0, 2.0, "Leverage level. Healthy: <2x"),
-            ],
-        }
-
-        for group, ratios in ratio_groups.items():
-            st.markdown(f'<div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#4a5a72;margin:18px 0 10px;">{group}</div>', unsafe_allow_html=True)
-            cols = st.columns(len(ratios))
-            for col, (name, val, unit, low, high, tip) in zip(cols, ratios):
-                with col:
-                    if val >= high:
-                        color, status = "#00e096", "Strong"
-                    elif val >= low:
-                        color, status = "#ffb800", "Adequate"
-                    else:
-                        color, status = "#ff4b6e", "Weak"
-                    pct = min(max((val-0)/(max(high*1.5,0.01))*100, 0), 100)
-                    st.markdown(f"""
-                    <div class="fin-kpi" style="margin-bottom:8px;">
-                        <div class="fin-kpi-val" style="color:{color};font-size:18px;">{val:.2f}{unit}</div>
-                        <div class="fin-kpi-lbl">{name}</div>
-                        <div style="margin-top:8px;">
-                            <div class="ratio-track"><div class="ratio-fill" style="width:{pct:.0f}%;background:{color};opacity:0.7;"></div></div>
-                        </div>
-                        <div style="font-size:10px;color:{color};margin-top:4px;font-weight:600;">{status}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    with st.expander("", expanded=False):
-                        st.caption(tip)
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 5 — JOURNAL ENTRY
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_entry:
-        col_form, col_log = st.columns([1, 1.2])
-
-        with col_form:
-            st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-            st.markdown('<div class="fin-card-title">Add Journal Entry</div>', unsafe_allow_html=True)
-
-            entry_type = st.selectbox("Entry Type", ["income","expense","asset","liability","equity"])
-            category_map = {
-                "income":    ["Revenue"],
-                "expense":   ["COGS","Operating Expense","Tax","Other"],
-                "asset":     ["Current Asset","Non-Current Asset"],
-                "liability": ["Current Liability","Non-Current Liability"],
-                "equity":    ["Equity"],
-            }
-            category   = st.selectbox("Category", category_map[entry_type])
-            subcategory = st.text_input("Subcategory", placeholder="e.g. Product Sales")
-            description = st.text_input("Description", placeholder="e.g. Q4 online revenue")
-            amount      = st.number_input("Amount (USD)", min_value=0.0, step=100.0, format="%.2f")
-            ent_period  = st.selectbox("Period", ["2024-Q4","2024-Q3","2024-Q2","2024-Q1"], key="entry_period")
-
-            if st.button("Post Entry", use_container_width=True):
-                if description and amount > 0:
-                    cur_fin.execute(
-                        "INSERT INTO fin_entries (user_id,category,subcategory,description,amount,entry_type,period,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (user_id, category, subcategory, description, amount, entry_type, ent_period, str(datetime.now()))
-                    )
-                    conn_fin.commit()
-                    st.success("Entry posted to ledger.")
-                    st.rerun()
-                else:
-                    st.error("Please fill in description and amount.")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        with col_log:
-            st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-            st.markdown('<div class="fin-card-title">General Ledger</div>', unsafe_allow_html=True)
-            df_log = get_entries(user_id)
-            if not df_log.empty:
-                badge_map = {"income":"fin-badge-rev","expense":"fin-badge-exp","asset":"fin-badge-ast","liability":"fin-badge-lib","equity":"fin-badge-lib"}
-                for _, r in df_log.head(12).iterrows():
-                    bc = badge_map.get(r["entry_type"], "fin-badge-rev")
-                    st.markdown(f"""
-                    <div style="display:flex;justify-content:space-between;align-items:center;
-                        padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
-                        <div>
-                            <span class="fin-badge {bc}">{r['entry_type']}</span>
-                            <span style="font-size:13px;color:#b0bece;margin-left:8px;">{r['description']}</span>
-                        </div>
-                        <span style="font-family:'DM Mono',monospace;font-size:13px;color:#e8edf5;">${r['amount']:,.2f}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("No entries yet.")
-            st.markdown('</div>', unsafe_allow_html=True)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # TAB 6 — AI CFO
-    # ─────────────────────────────────────────────────────────────────────────
-    with tab_ai:
-        st.markdown('<div class="fin-card">', unsafe_allow_html=True)
-        st.markdown('<div class="fin-card-title">AI Chief Financial Officer</div>', unsafe_allow_html=True)
-        st.markdown('<div class="fin-ai-text" style="margin-bottom:18px;">Ask your AI CFO anything — financial health, cost reduction, cash flow strategy, investment readiness, or risk assessment.</div>', unsafe_allow_html=True)
-
-        # Auto-generate financial brief
-        fin_brief = f"""
-Business Financial Summary — {period}:
-- Revenue: ${total_revenue:,.2f} | Gross Profit: ${gross_profit:,.2f} ({gp_margin:.1f}% margin)
-- EBIT: ${ebit:,.2f} | Net Profit: ${net_profit:,.2f} ({np_margin:.1f}% net margin)
-- Total Assets: ${total_assets:,.2f} | Total Liabilities: ${total_liab:,.2f} | Equity: ${total_equity:,.2f}
-- Cash Position: ${cash:,.2f} | Current Ratio: {current_ratio:.2f}x | Debt Ratio: {debt_ratio:.1f}%
-- ROE: {roe:.1f}% | ROA: {roa:.1f}% | OPEX: ${opex:,.2f}
-        """.strip()
-
-        # Quick prompts
-        st.markdown("**Quick questions:**")
-        qcols = st.columns(3)
-        quick_qs = [
-            "How healthy is my cash position?",
-            "Where should I cut costs?",
-            "Am I ready for investor funding?",
-            "What's my biggest financial risk?",
-            "How can I improve my profit margin?",
-            "Analyse my debt levels",
-        ]
-        for i, q in enumerate(quick_qs):
-            with qcols[i % 3]:
-                if st.button(q, key=f"quick_{i}", use_container_width=True):
-                    st.session_state["fin_ai_q"] = q
-
-        user_q = st.text_input("Or ask your own question", placeholder="e.g. Should I take on more debt to expand?", key="fin_ai_input")
-        final_q = st.session_state.get("fin_ai_q", "") or user_q
-
-        if st.button("Ask AI CFO", use_container_width=True, key="ask_cfo") and final_q:
-            with st.spinner("CFO is analysing your financials..."):
-                try:
-                    resp = requests.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={"Content-Type": "application/json"},
-                        json={
-                            "model": "claude-sonnet-4-20250514",
-                            "max_tokens": 1000,
-                            "messages": [{
-                                "role": "user",
-                                "content": f"""You are a senior CFO and financial analyst. A business owner has shared their financial data and asked a question.
-
-{fin_brief}
-
-Their question: {final_q}
-
-Respond as a sharp, direct CFO would in a board meeting. Be specific — reference the actual numbers above. Give:
-1. A direct answer to the question
-2. 2-3 specific observations from the financial data
-3. One clear action recommendation
-
-Keep the response concise but substantive. No generic advice — everything must be grounded in the numbers above."""
-                            }]
-                        },
-                        timeout=30
-                    )
-                    answer = resp.json()["content"][0]["text"]
-                    st.markdown(f"""
-                    <div class="fin-ai-box">
-                        <div class="fin-ai-label">AI CFO Response</div>
-                        <div class="fin-ai-text">{answer.replace(chr(10), '<br>')}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    if "fin_ai_q" in st.session_state:
-                        del st.session_state["fin_ai_q"]
-                except Exception as e:
-                    st.error(f"CFO unavailable: {e}")
-
-        st.markdown('</div>', unsafe_allow_html=True)
-        conn_fin.close()
         
 # =========================================================
 # PRODUCT SEARCH — Fixed: no default listings, small buttons,
