@@ -3456,39 +3456,41 @@ elif "Prediction & Intelligence" in menu:
         </div>""", unsafe_allow_html=True)
 
 # =========================================================
-# SUPPLIER INBOX & PRODUCTS — Fixed image_url column error
+# SUPPLIER INBOX & PRODUCTS — Demo version (no database)
 # =========================================================
 elif "Inbox & Products" in menu:
-    import random
+    import datetime
 
     st.markdown("# Inbox & Product Manager")
     st.markdown('<div class="section-label">Communicate with customers · Manage product info & images</div>', unsafe_allow_html=True)
 
-    # ── Ensure tables + columns exist ──
-    c2 = sqlite3.connect("venus_ai.db")
-    c2.execute("""CREATE TABLE IF NOT EXISTS seller_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        seller_name TEXT, buyer_id INTEGER,
-        sender TEXT, message TEXT, sent_at DATETIME)""")
-    c2.execute("""CREATE TABLE IF NOT EXISTS cart (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        buyer_id INTEGER, product TEXT, price REAL, qty INTEGER,
-        supplier TEXT, location TEXT, status TEXT DEFAULT 'pending',
-        added_at DATETIME)""")
+    # ── In-memory demo data (lives in session_state, resets on app restart) ──
+    if "demo_messages" not in st.session_state:
+        st.session_state.demo_messages = [
+            {"id": 1, "buyer_id": 101, "sender": "buyer", "message": "Hi, is this still in stock?", "sent_at": "2026-06-17 09:12"},
+            {"id": 2, "buyer_id": 101, "sender": "supplier", "message": "Yes! We have plenty available.", "sent_at": "2026-06-17 09:20"},
+            {"id": 3, "buyer_id": 205, "sender": "buyer", "message": "Can you deliver to Kitwe?", "sent_at": "2026-06-18 14:02"},
+        ]
 
-    # Safely add optional columns — each in its own try/except
-    for alter_sql in [
-        "ALTER TABLE products ADD COLUMN description TEXT",
-        "ALTER TABLE products ADD COLUMN image_url TEXT",
-        "ALTER TABLE products ADD COLUMN image_data TEXT",
-    ]:
-        try:
-            c2.execute(alter_sql)
-            c2.commit()
-        except Exception:
-            pass  # Column already exists — safe to ignore
+    if "demo_orders" not in st.session_state:
+        st.session_state.demo_orders = [
+            {"id": 1, "buyer_id": 101, "product": "Maize Seed (10kg)", "price": 25.0, "qty": 2, "status": "pending", "added_at": "2026-06-18 08:00"},
+            {"id": 2, "buyer_id": 205, "product": "Fertilizer (50kg)", "price": 60.0, "qty": 1, "status": "fulfilled", "added_at": "2026-06-15 11:30"},
+        ]
 
-    c2.commit()
+    if "demo_products" not in st.session_state:
+        st.session_state.demo_products = [
+            {
+                "id": 1, "product": "Maize Seed (10kg)", "price": 25.0, "qty": 40,
+                "location": "Lusaka", "description": "High-yield hybrid maize seed, drought tolerant.",
+                "image_url": ""
+            },
+            {
+                "id": 2, "product": "Fertilizer (50kg)", "price": 60.0, "qty": 15,
+                "location": "Lusaka", "description": "Balanced NPK fertilizer for general use.",
+                "image_url": ""
+            },
+        ]
 
     inbox_tab, products_tab = st.tabs(["Customer Inbox", "Product Info Manager"])
 
@@ -3496,19 +3498,8 @@ elif "Inbox & Products" in menu:
     # TAB 1 — INBOX
     # ═══════════════════════════════════
     with inbox_tab:
-        supplier_name = user.get("name", "")
-        msgs = c2.execute("""
-            SELECT id, seller_name, buyer_id, sender, message, sent_at
-            FROM seller_messages
-            WHERE seller_name = ? OR seller_name = ?
-            ORDER BY sent_at DESC
-        """, (supplier_name, user.get("username", ""))).fetchall()
-
-        orders = c2.execute("""
-            SELECT id, buyer_id, product, price, qty, status, added_at
-            FROM cart WHERE supplier = ? OR supplier = ?
-            ORDER BY id DESC
-        """, (supplier_name, user.get("username", ""))).fetchall()
+        msgs = st.session_state.demo_messages
+        orders = st.session_state.demo_orders
 
         oc1, oc2 = st.columns([1.4, 1])
 
@@ -3517,10 +3508,8 @@ elif "Inbox & Products" in menu:
             if msgs:
                 buyers = {}
                 for m in msgs:
-                    bid = m[2]
-                    if bid not in buyers:
-                        buyers[bid] = []
-                    buyers[bid].append(m)
+                    bid = m["buyer_id"]
+                    buyers.setdefault(bid, []).append(m)
 
                 selected_buyer = st.selectbox(
                     "Conversation with buyer",
@@ -3535,18 +3524,18 @@ elif "Inbox & Products" in menu:
                     border-radius:14px;padding:16px;min-height:200px;max-height:320px;
                     overflow-y:auto;margin-bottom:12px;">""", unsafe_allow_html=True)
                 for m in reversed(convo[-20:]):
-                    is_buyer = m[3] == "buyer"
+                    is_buyer = m["sender"] == "buyer"
                     side  = "flex-start" if is_buyer else "flex-end"
                     bg    = "rgba(255,255,255,0.04)" if is_buyer else "rgba(0,229,255,0.1)"
                     bc    = "rgba(255,255,255,0.06)" if is_buyer else "rgba(0,229,255,0.2)"
-                    lbl   = f"Buyer #{m[2]}" if is_buyer else "You (supplier)"
+                    lbl   = f"Buyer #{m['buyer_id']}" if is_buyer else "You (supplier)"
                     st.markdown(f"""
                     <div style="display:flex;justify-content:{side};margin:6px 0;">
                         <div style="max-width:75%;background:{bg};border:1px solid {bc};
                             border-radius:12px;padding:9px 13px;">
                             <div style="font-size:10px;color:#9aaabf;margin-bottom:4px;">{lbl}</div>
-                            <div style="font-size:13px;color:#e8edf5;">{m[4]}</div>
-                            <div style="font-size:10px;color:#6a7a92;margin-top:4px;">{str(m[5])[:16]}</div>
+                            <div style="font-size:13px;color:#e8edf5;">{m['message']}</div>
+                            <div style="font-size:10px;color:#6a7a92;margin-top:4px;">{m['sent_at']}</div>
                         </div>
                     </div>""", unsafe_allow_html=True)
                 st.markdown("</div>", unsafe_allow_html=True)
@@ -3554,11 +3543,13 @@ elif "Inbox & Products" in menu:
                 reply_msg = st.text_input("Your reply", placeholder="Type your message...", key="inbox_reply")
                 if st.button("Send Reply", key="inbox_send", use_container_width=False):
                     if reply_msg.strip():
-                        c2.execute(
-                            "INSERT INTO seller_messages (seller_name,buyer_id,sender,message,sent_at) VALUES (?,?,?,?,?)",
-                            (supplier_name, selected_buyer, "supplier", reply_msg, str(datetime.datetime.now()))
-                        )
-                        c2.commit()
+                        st.session_state.demo_messages.append({
+                            "id": len(st.session_state.demo_messages) + 1,
+                            "buyer_id": selected_buyer,
+                            "sender": "supplier",
+                            "message": reply_msg,
+                            "sent_at": str(datetime.datetime.now())[:16]
+                        })
                         st.success("Reply sent!")
                         st.rerun()
             else:
@@ -3572,27 +3563,26 @@ elif "Inbox & Products" in menu:
         with oc2:
             st.markdown("#### Incoming Orders")
             if orders:
-                pending = [o for o in orders if o[5] == "pending"]
+                pending = [o for o in orders if o["status"] == "pending"]
                 st.markdown(f'<div style="font-size:12px;color:#ffb800;margin-bottom:10px;">{len(pending)} pending orders</div>', unsafe_allow_html=True)
                 for o in orders[:8]:
-                    status_color = "#ffb800" if o[5] == "pending" else "#00e096"
+                    status_color = "#ffb800" if o["status"] == "pending" else "#00e096"
                     st.markdown(f"""
                     <div class="venus-card" style="padding:12px;margin-bottom:8px;border-color:{status_color}20;">
                         <div style="display:flex;justify-content:space-between;align-items:center;">
                             <div>
-                                <div style="font-size:13px;font-weight:700;color:#e8edf5;">{o[2]}</div>
+                                <div style="font-size:13px;font-weight:700;color:#e8edf5;">{o['product']}</div>
                                 <div style="font-size:11px;color:#9aaabf;margin-top:2px;">
-                                    Buyer #{o[1]} · Qty: {o[4]} · ${o[3]*o[4]:.2f}
+                                    Buyer #{o['buyer_id']} · Qty: {o['qty']} · ${o['price']*o['qty']:.2f}
                                 </div>
-                                <div style="font-size:10px;color:#6a7a92;">{str(o[6])[:16]}</div>
+                                <div style="font-size:10px;color:#6a7a92;">{o['added_at']}</div>
                             </div>
-                            <span style="font-size:11px;font-weight:700;color:{status_color};text-transform:uppercase;">{o[5]}</span>
+                            <span style="font-size:11px;font-weight:700;color:{status_color};text-transform:uppercase;">{o['status']}</span>
                         </div>
                     </div>""", unsafe_allow_html=True)
-                    if o[5] == "pending":
-                        if st.button("Mark Fulfilled", key=f"fulfill_{o[0]}"):
-                            c2.execute("UPDATE cart SET status='fulfilled' WHERE id=?", (o[0],))
-                            c2.commit()
+                    if o["status"] == "pending":
+                        if st.button("Mark Fulfilled", key=f"fulfill_{o['id']}"):
+                            o["status"] = "fulfilled"
                             st.rerun()
             else:
                 st.markdown("""
@@ -3608,50 +3598,46 @@ elif "Inbox & Products" in menu:
         st.markdown("#### Manage Your Product Listings")
         st.markdown('<div class="section-label">Add descriptions, upload images, and update product details</div>', unsafe_allow_html=True)
 
-        # image_url is now guaranteed to exist — safe to query
-        my_products = c2.execute("""
-            SELECT id, product, price, qty, location, description, image_url
-            FROM products WHERE user_id = ?
-        """, (user["id"],)).fetchall()
+        my_products = st.session_state.demo_products
 
         if not my_products:
             st.info("No products found. Go to Add Product to list your first item.")
         else:
             selected_pid = st.selectbox(
                 "Select product to edit",
-                [p[0] for p in my_products],
-                format_func=lambda x: next(p[1] for p in my_products if p[0] == x),
+                [p["id"] for p in my_products],
+                format_func=lambda x: next(p["product"] for p in my_products if p["id"] == x),
                 key="pm_select"
             )
-            prod = next(p for p in my_products if p[0] == selected_pid)
+            prod = next(p for p in my_products if p["id"] == selected_pid)
 
             pm_l, pm_r = st.columns([1, 1])
 
             with pm_l:
                 st.markdown("##### Product Details")
-                new_name  = st.text_input("Product Name",  value=prod[1],            key="pm_name")
-                new_price = st.number_input("Price ($)",   value=float(prod[2]),      min_value=0.0, key="pm_price")
-                new_qty   = st.number_input("Stock Qty",   value=int(prod[3]),        min_value=0,   key="pm_qty")
-                new_loc   = st.text_input("Location",      value=prod[4] or "",       key="pm_loc")
+                new_name  = st.text_input("Product Name",  value=prod["product"],            key="pm_name")
+                new_price = st.number_input("Price ($)",   value=float(prod["price"]),        min_value=0.0, key="pm_price")
+                new_qty   = st.number_input("Stock Qty",   value=int(prod["qty"]),             min_value=0,   key="pm_qty")
+                new_loc   = st.text_input("Location",      value=prod["location"] or "",       key="pm_loc")
                 new_desc  = st.text_area(
                     "Product Description",
-                    value=prod[5] or f"Quality {prod[1]} available in {prod[4] or 'Lusaka'}.",
+                    value=prod["description"] or f"Quality {prod['product']} available in {prod['location'] or 'Lusaka'}.",
                     height=100, key="pm_desc",
                     placeholder="Describe your product — condition, features, why buyers should choose you..."
                 )
 
                 if st.button("Save Product Info", key="pm_save", use_container_width=True):
-                    c2.execute(
-                        "UPDATE products SET product=?,price=?,qty=?,location=?,description=? WHERE id=?",
-                        (new_name, new_price, new_qty, new_loc, new_desc, selected_pid)
-                    )
-                    c2.commit()
+                    prod["product"] = new_name
+                    prod["price"] = new_price
+                    prod["qty"] = new_qty
+                    prod["location"] = new_loc
+                    prod["description"] = new_desc
                     st.success("Product updated!")
                     st.rerun()
 
             with pm_r:
                 st.markdown("##### Product Image")
-                current_img = prod[6]  # image_url — now safe
+                current_img = prod["image_url"]
                 if current_img and current_img.startswith("http"):
                     st.image(current_img, caption="Current product image", use_container_width=True)
                 elif current_img and current_img.startswith("data:"):
@@ -3681,8 +3667,7 @@ elif "Inbox & Products" in menu:
                         b64         = _b64.b64encode(img_bytes).decode()
                         new_img_url = f"data:{uploaded_img.type};base64,{b64}"
                     if new_img_url:
-                        c2.execute("UPDATE products SET image_url=? WHERE id=?", (new_img_url, selected_pid))
-                        c2.commit()
+                        prod["image_url"] = new_img_url
                         st.success("Image updated!")
                         st.rerun()
 
@@ -3699,8 +3684,7 @@ elif "Inbox & Products" in menu:
                         {(new_desc or '')[:120]}{'...' if len(new_desc or '') > 120 else ''}
                     </div>
                 </div>""", unsafe_allow_html=True)
-
-        
+                
 # =========================================================
 # PRODUCT SEARCH — Fixed: no default listings, small buttons,
 # no raw code in detail view, all logic inline (single file)
