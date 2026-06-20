@@ -62,14 +62,14 @@ The system combines machine learning, computer vision, and intelligent analytics
 
 ## System Architecture
 
-Inventory Data
-↓
-Vision AI Analysis
-↓
-Demand Forecasting
-↓
+Inventory Management
+ ├── Product Data
+ └── Vision AI
+
 Supplier Intelligence
-↓
+ ├── Prediction Engine
+ └── Supplier Trust Scoring
+
 Business Decision Support
 
 ---
